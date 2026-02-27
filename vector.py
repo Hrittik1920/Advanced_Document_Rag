@@ -10,7 +10,7 @@ from tqdm import tqdm # Import tqdm for the progress bar
 DOCUMENTS_DIRECTORY = "./test_documents"
 DB_LOCATION = "./chroma_langchain_db"
 FILE_HASH_DB = os.path.join(DB_LOCATION, "file_hashes.json")
-EMBEDDINGS = OllamaEmbeddings(model="mxbai-embed-large")
+EMBEDDINGS = OllamaEmbeddings(model="qwen3-embedding:4b")
 COLLECTION_NAME = "multi_format_documents"
 
 def get_file_hash(file_path):
