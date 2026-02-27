@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Chat Assistant</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="chat-container">
+        <header class="chat-header">
+            <h1>Chat Assistant</h1>
+            <p>Powered by Llama, FastAPI & LangChain</p>
+        </header>
+        <main class="chat-box" id="chat-box">
+            <!-- Chat messages will be appended here -->
+            <div class="message bot-message">
+                <p>Hello! How can I help you today?</p>
+            </div>
+        </main>
+        <footer class="chat-input-area">
+            <form id="chat-form">
+                <input type="text" id="user-input" placeholder="Type your message here..." autocomplete="off">
+                <button type="submit" id="send-button">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                        <path d="M3.478 2.405a.75.75 0 00-.926.94l2.432 7.905H13.5a.75.75 0 010 1.5H4.984l-2.432 7.905a.75.75 0 00.926.94 60.519 60.519 0 0018.445-8.986.75.75 0 000-1.218A60.517 60.517 0 003.478 2.405z" />
+                    </svg>
+                </button>
+            </form>
+        </footer>
+    </div>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/static/script.js"></script>
+</body>
+</html>
