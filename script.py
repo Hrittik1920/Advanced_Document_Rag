@@ -13,10 +13,7 @@ MAX_CONTEXT_CHARS = 8_000
 model = OllamaLLM(model=MODEL_NAME)
 
 # --- Prompt Template ---
-# The history placeholder will be filled by server.py
-# script.py
 
-# script.py
 # script.py
 
 prompt = ChatPromptTemplate.from_messages([

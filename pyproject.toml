@@ -217,6 +217,7 @@ dependencies = [
     "parso==0.8.4",
     "passlib==1.7.4",
     "pathspec==0.12.1",
+    "pdf2image>=1.17.0",
     "peewee==3.18.1",
     "peewee-migrate==1.12.2",
     "pexpect==4.9.0",

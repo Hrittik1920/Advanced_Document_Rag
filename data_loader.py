@@ -1,15 +1,23 @@
 import os
+import io
+import asyncio
+import nest_asyncio
+import cv2
+import pytesseract
+import numpy as np
 import pandas as pd
 from langchain_core.documents import Document
 import PyPDF2
-from docx import Document as DocxDocument
 from pathlib import Path
+from PIL import Image
+from pdf2image import convert_from_path
+from docx import Document as DocxDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import hashlib
-import io
-import cv2
-import pytesseract
 
+# Import your VLM client and settings
+from llm_clients import query_ollama
+
+nest_asyncio.apply()
 class MultiFormatDocumentLoader:
     """
     Load and process various document formats with significant optimizations
@@ -19,7 +27,7 @@ class MultiFormatDocumentLoader:
     def __init__(self, chunk_size=2000, chunk_overlap=200):
         self.supported_extensions = {
             ".pdf", ".docx", ".csv", ".xlsx", ".xls", ".txt",
-            ".png", ".jpg", ".jpeg", ".bmp", ".tiff"  # <-- ADDED IMAGE EXTENSIONS
+            ".png", ".jpg", ".jpeg", ".bmp", ".tiff"
         }
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -28,29 +36,83 @@ class MultiFormatDocumentLoader:
             length_function=len,
         )
 
+    # --- Helper Method (ADDED) ---
     def _create_documents_from_text(self, text: str, metadata: dict) -> list[Document]:
-        """Splits a single large text into multiple Document objects."""
-        if not text.strip():
+        """Helper to split extracted text into Document objects."""
+        if not text or not text.strip():
             return []
-        
-        chunks = self.text_splitter.split_text(text)
-        docs = []
-        for i, chunk_text in enumerate(chunks):
-            doc_metadata = metadata.copy()
-            doc_metadata["chunk_number"] = i + 1
-            docs.append(Document(page_content=chunk_text, metadata=doc_metadata))
-        return docs
+        # Langchain's text splitter can process a list of texts and metadatas
+        return self.text_splitter.create_documents([text], metadatas=[metadata])
 
-    def load_txt(self, file_path: str) -> list[Document]:
-        """Loads a .txt file and processes it."""
+    # --- New Internal OCR Logic (Hybrid Tesseract + VLM) ---
+
+    async def _get_ocr_text_async(self, file_path, origin_info="Image"):
+        """Internal async method to handle the OCR logic flow."""
+        ocr_text = ""
+        confidence = 0
+        
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            with open(file_path, "r", encoding="latin-1") as f:
-                text = f.read()
-        metadata = {"source": os.path.basename(file_path), "file_type": "txt"}
-        return self._create_documents_from_text(text, metadata)
+            # Tesseract Step
+            img = cv2.imread(file_path)
+            if img is not None:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                ocr_data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DICT)
+                ocr_text = pytesseract.image_to_string(thresh).strip()
+                
+                confidences = [int(conf) for conf in ocr_data['conf'] if int(conf) != -1]
+                confidence = sum(confidences) / len(confidences) if confidences else 0
+        except Exception as e:
+            print(f"⚠️ Tesseract failed for {origin_info}: {e}")
+
+        # Quality Check & VLM Fallback
+        if self._should_use_vlm_fallback(ocr_text, confidence):
+            print(f"🔄 Low quality result for {origin_info}. Falling back to VLM...")
+            try:
+                ocr_text = await query_ollama(
+                    prompt="Extract all readable text from this image. Return only text.",
+                    model="deepseek-ocr:latest",
+                    image_path=file_path,
+                    keep_alive=0
+                )
+            except Exception as e:
+                print(f"❌ VLM Fallback failed: {e}")
+        
+        return ocr_text
+
+    def _should_use_vlm_fallback(self, text, confidence):
+        """Logic to decide if OCR quality is sufficient."""
+        if not text or len(text) < 10 or confidence < 60:
+            return True
+        
+        words = text.split()
+        if not words: return True
+        
+        avg_word_length = sum(len(w) for w in words) / len(words)
+        if avg_word_length < 2.5: return True # Fragmented text
+        
+        return False
+
+    def _run_async_ocr(self, file_path, origin_info):
+        """Helper to run the async OCR logic in a synchronous environment."""
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        return loop.run_until_complete(self._get_ocr_text_async(file_path, origin_info))
+
+    # --- Updated Loaders ---
+
+    def load_image(self, file_path: str) -> list[Document]:
+        """Extracts text using the Hybrid OCR logic."""
+        print(f"⏳ Processing Image: {os.path.basename(file_path)}")
+        full_text = self._run_async_ocr(file_path, os.path.basename(file_path))
+        
+        metadata = {"source": os.path.basename(file_path), "file_type": "image"}
+        return self._create_documents_from_text(full_text, metadata)
 
     def load_pdf(self, file_path: str) -> list[Document]:
         """
@@ -58,12 +120,38 @@ class MultiFormatDocumentLoader:
         and then splits the combined text into chunks.
         """
         full_text = ""
+        is_scanned = True
+        
         try:
             with open(file_path, "rb") as f:
                 pdf_reader = PyPDF2.PdfReader(f)
+                temp_text = ""
                 for page in pdf_reader.pages:
-                    full_text += page.extract_text() or ""
-                    full_text += "\n" # Add a separator between pages
+                    temp_text += page.extract_text() or ""
+                
+                if len(temp_text.strip()) > 50:
+                    full_text = temp_text
+                    is_scanned = False
+
+            # 2. Fallback to OCR if scanned
+            if is_scanned:
+                print(f"⚠️ PDF appears scanned: {os.path.basename(file_path)}. Converting to images...")
+                images = convert_from_path(file_path)
+                ocr_pages = []
+                
+                for i, img in enumerate(images):
+                    # Save temporary page image
+                    temp_page_path = f"temp_page_{i}.png"
+                    img.save(temp_page_path, "PNG")
+                    
+                    page_text = self._run_async_ocr(temp_page_path, f"Page {i+1}")
+                    ocr_pages.append(page_text)
+                    
+                    if os.path.exists(temp_page_path):
+                        os.remove(temp_page_path)
+                
+                full_text = "\n\n".join(ocr_pages)
+
         except Exception as e:
             print(f"Error loading PDF {file_path}: {e}")
             return []
@@ -84,37 +172,6 @@ class MultiFormatDocumentLoader:
             return []
             
         metadata = {"source": os.path.basename(file_path), "file_type": "docx"}
-        return self._create_documents_from_text(full_text, metadata)
-
-    def load_image(self, file_path: str) -> list[Document]:
-        """
-        Extracts text from an image using OpenCV and Tesseract OCR,
-        and then splits the text into document chunks.
-        """
-        full_text = ""
-        try:
-            print(f"Running Tesseract OCR for {os.path.basename(file_path)}...")
-            img = cv2.imread(file_path)
-            
-            if img is None:
-                print(f"Error loading Image {file_path}: Image is unreadable or not found.")
-                return []
-                
-            # Convert to grayscale and apply Otsu's thresholding for better OCR
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Extract text
-            full_text = pytesseract.image_to_string(thresh).strip()
-            
-            # NOTE: If you still want your VLM fallback logic, you can check 
-            # if not full_text here and call your synchronous VLM function.
-
-        except Exception as e:
-            print(f"Error loading Image {file_path}: {e}")
-            return []
-
-        metadata = {"source": os.path.basename(file_path), "file_type": "image"}
         return self._create_documents_from_text(full_text, metadata)
 
     def load_csv(self, file_path: str, rows_per_chunk: int = 250) -> list[Document]:
@@ -145,8 +202,7 @@ class MultiFormatDocumentLoader:
 
     def load_excel(self, file_path: str) -> list[Document]:
         """
-        Processes each sheet in an Excel file. For simplicity, we still process
-        row-by-row here, but a CSV-like chunking could be added if needed.
+        Processes each sheet in an Excel file.
         """
         docs = []
         try:
@@ -165,6 +221,19 @@ class MultiFormatDocumentLoader:
             print(f"Error loading Excel {file_path}: {e}")
         return docs
 
+    # --- TXT Loader (ADDED) ---
+    def load_txt(self, file_path: str) -> list[Document]:
+        """Extracts text from a standard .txt file."""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                full_text = f.read()
+        except Exception as e:
+            print(f"Error loading TXT {file_path}: {e}")
+            return []
+        
+        metadata = {"source": os.path.basename(file_path), "file_type": "txt"}
+        return self._create_documents_from_text(full_text, metadata)
+
     def load_document(self, file_path: str) -> list[Document]:
         """Public method to load a single document based on its extension."""
         ext = Path(file_path).suffix.lower()
@@ -178,7 +247,7 @@ class MultiFormatDocumentLoader:
             return self.load_excel(file_path)
         if ext == ".txt":
             return self.load_txt(file_path)
-        if ext in {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}: # <-- ADDED THIS BLOCK
+        if ext in {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}: 
             return self.load_image(file_path)
             
         print(f"Unsupported file type: {ext}")

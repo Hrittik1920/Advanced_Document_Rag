@@ -102,22 +102,23 @@ async def handle_chat_request(sid, data: dict):
         return
 
     print(f"Received query from {sid}: {user_query}")
-    retrieved_docs = retriever.invoke(user_query)
+    
+    # 1. Use ainvoke to prevent blocking the async event loop
+    retrieved_docs = await retriever.ainvoke(user_query)
     context = format_documents(retrieved_docs)
 
-    if not context.strip():
-        final_answer = "I could not find relevant information in the uploaded documents to answer your question."
-    else:
-        print(f"Invoking RAG chain for session {sid}...")
-        response = await chain_with_history.ainvoke(
-            {"context": context, "question": user_query},
-            config={"configurable": {"session_id": sid}}
-        )
-        final_answer = response
+    print(f"Invoking RAG chain for session {sid}...")
+    
+    # 2. Always run the chain to ensure the history manager records the conversation,
+    # even if the context is empty. Your system prompt will handle the empty context gracefully.
+    response = await chain_with_history.ainvoke(
+        {"context": context, "question": user_query},
+        config={"configurable": {"session_id": sid}}
+    )
     
     await sio.emit(
         "chat_response", 
-        {"role": "assistant", "content": final_answer}, 
+        {"role": "assistant", "content": response}, 
         to=sid
     )
 
