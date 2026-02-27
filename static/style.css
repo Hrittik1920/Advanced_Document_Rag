@@ -617,7 +617,6 @@ body {
 /* Styling for individual list items */
 .formatted-response li {
     margin-bottom: 10px;
-    padding-left: 15px; /* <-- This is the fix! */
 }
 
 /* Styling for nested lists to ensure clear indentation */
