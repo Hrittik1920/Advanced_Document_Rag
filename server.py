@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse 
@@ -102,24 +103,53 @@ async def handle_chat_request(sid, data: dict):
         return
 
     print(f"Received query from {sid}: {user_query}")
-    retrieved_docs = retriever.invoke(user_query)
+    
+    # 1. Use ainvoke to prevent blocking the async event loop
+    retrieved_docs = await retriever.ainvoke(user_query)
     context = format_documents(retrieved_docs)
+    
+    # Ensure context is never None/empty - use a default if needed
+    if not context:
+        context = "No relevant documents found in the knowledge base."
 
-    if not context.strip():
-        final_answer = "I could not find relevant information in the uploaded documents to answer your question."
-    else:
-        print(f"Invoking RAG chain for session {sid}...")
+    print(f"Invoking RAG chain for session {sid} with streaming...")
+    
+    # 2. Get the full response using ainvoke (compatible with RunnableWithMessageHistory)
+    full_response = ""
+    try:
         response = await chain_with_history.ainvoke(
             {"context": context, "question": user_query},
             config={"configurable": {"session_id": sid}}
         )
-        final_answer = response
-    
-    await sio.emit(
-        "chat_response", 
-        {"role": "assistant", "content": final_answer}, 
-        to=sid
-    )
+        full_response = response
+        
+        # Stream the response in chunks to the client
+        chunk_size = 20
+        for i in range(0, len(full_response), chunk_size):
+            chunk = full_response[i:i + chunk_size]
+            if chunk:
+                await sio.emit(
+                    "chat_stream_chunk", 
+                    {"chunk": chunk}, 
+                    to=sid
+                )
+                # Small delay to create streaming effect
+                await asyncio.sleep(0.05)
+        
+        # Emit end-of-stream signal
+        await sio.emit(
+            "chat_stream_end", 
+            {"message": "Stream complete"},
+            to=sid
+        )
+        
+    except Exception as e:
+        print(f"Error during streaming: {e}")
+        await sio.emit(
+            "error", 
+            {"message": f"Stream error: {str(e)}"}, 
+            to=sid
+        )
 
 # --- Standard FastAPI Endpoints ---
 @app.get("/")

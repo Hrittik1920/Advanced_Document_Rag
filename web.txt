@@ -1,0 +1,317 @@
+document.addEventListener("DOMContentLoaded", () => {
+    const chatForm = document.getElementById("chat-form");
+    const userInput = document.getElementById("user-input");
+    const chatBox = document.getElementById("chat-box");
+    const sendButton = document.getElementById("send-button");
+
+    let isRequestInProgress = false;
+    let currentStreamElement = null;
+
+    // --- 1. Connect to the Socket.IO server ---
+    const socket = io("http://178.63.15.33:8000")
+
+    // --- Event listener for successful connection ---
+    socket.on("connect", () => {
+        console.log("✅ Successfully connected to the server with SID:", socket.id);
+    });
+
+    // --- 2. Listen for streaming chunks from the server ---
+    socket.on("chat_stream_chunk", (data) => {
+        // Create message element on first chunk
+        if (!currentStreamElement) {
+            hideLoadingIndicator();
+            currentStreamElement = document.createElement("div");
+            currentStreamElement.classList.add("message", "bot-message");
+            currentStreamElement.innerHTML = '<div class="formatted-response"></div>';
+            chatBox.appendChild(currentStreamElement);
+        }
+
+        // Append chunk to the formatted response container
+        const formattedResponseDiv = currentStreamElement.querySelector('.formatted-response');
+        const chunkText = data.chunk || "";
+        
+        // Append raw text and re-render markdown
+        const currentContent = formattedResponseDiv.textContent;
+        const newContent = currentContent + chunkText;
+        formattedResponseDiv.innerHTML = marked.parse(newContent);
+        
+        scrollToBottom();
+    });
+
+    // --- 3. Listen for chat completion signal ---
+    socket.on("chat_stream_complete", (data) => {
+        currentStreamElement = null;
+        isRequestInProgress = false;
+        sendButton.disabled = false;
+        userInput.focus();
+    });
+
+    // --- 2. [DEPRECATED] Listen for 'chat_response' from the server ---
+    socket.on("chat_response", (data) => {
+        hideLoadingIndicator();
+        appendMessage(data.content, "bot-message");
+        isRequestInProgress = false;
+        sendButton.disabled = false;
+        userInput.focus();
+    });
+    
+    // --- Event listener for potential server errors ---
+    socket.on("error", (data) => {
+        console.error("Server Error:", data.message);
+        hideLoadingIndicator();
+        appendMessage(`Sorry, an error occurred: ${data.message}`, "bot-message");
+        isRequestInProgress = false;
+        sendButton.disabled = false;
+    });
+
+    // --- Function to handle sending a message ---
+    const handleSendMessage = () => {
+        if (isRequestInProgress) return;
+        const userMessage = userInput.value.trim();
+
+        if (userMessage) {
+            isRequestInProgress = true;
+            sendButton.disabled = true;
+            appendMessage(userMessage, "user-message");
+            userInput.value = "";
+            showLoadingIndicator();
+            socket.emit("chat_request", { message: userMessage });
+        }
+    };
+
+    chatForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        handleSendMessage();
+    });
+
+    /**
+     * Appends a message to the chat box.
+     */
+    function appendMessage(content, className) {
+        const messageElement = document.createElement("div");
+        messageElement.classList.add("message", className);
+
+        if (className === 'bot-message') {
+            // Bot messages are formatted to handle Markdown
+            const formattedContent = formatBotResponse(content);
+            messageElement.appendChild(formattedContent);
+        } else {
+            // User messages are plain text
+            const p = document.createElement("p");
+            p.textContent = content;
+            messageElement.appendChild(p);
+        }
+        
+        chatBox.appendChild(messageElement);
+        scrollToBottom();
+    }
+
+    // static/script.js
+    // static/script.js
+
+    /**
+     * Parses the bot's entire Markdown response into a single, formatted HTML block.
+     * @param {string} markdownText - The raw markdown string from the bot.
+     * @returns {HTMLElement} - A div element containing the formatted HTML.
+     */
+    function formatBotResponse(markdownText) {
+        const container = document.createElement('div');
+        container.className = 'formatted-response';
+
+        // Sanitize for real newlines and tabs
+        const sanitizedText = markdownText.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+
+        // Use the marked.js library to convert the entire response into HTML
+        container.innerHTML = marked.parse(sanitizedText);
+        
+        return container;
+    }
+    
+
+    // --- Helper functions ---
+    function showLoadingIndicator() {
+        const loadingElement = document.createElement("div");
+        loadingElement.classList.add("message", "bot-message", "loading-indicator");
+        loadingElement.id = "loading-indicator";
+        loadingElement.innerHTML = `<span></span><span></span><span></span>`;
+        chatBox.appendChild(loadingElement);
+        scrollToBottom();
+    }
+
+    function hideLoadingIndicator() {
+        const loadingElement = document.getElementById("loading-indicator");
+        if (loadingElement) {
+            loadingElement.remove();
+        }
+    }
+
+    function scrollToBottom() {
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+});
+
+
+import os
+import json
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse 
+from typing import List, Dict
+import socketio
+import uvicorn
+
+# --- Your Existing RAG and LangChain Imports ---
+from vector import retriever
+# New, correct line
+from script import format_documents, original_chain
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
+
+# --- CONFIGURATION ---
+HISTORY_DIR = "chat_histories"
+os.makedirs(HISTORY_DIR, exist_ok=True)
+
+# --- Custom Chat History Class for File Persistence ---
+# This class is already perfect and needs no changes.
+class FileChatMessageHistory(BaseChatMessageHistory):
+    session_id: str
+    file_path: str
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.file_path = os.path.join(HISTORY_DIR, f"{self.session_id}.json")
+
+    @property
+    def messages(self) -> List[BaseMessage]:
+        if not os.path.exists(self.file_path):
+            return []
+        with open(self.file_path, "r", encoding="utf-8") as f:
+            try:
+                dicts = json.load(f)
+                return messages_from_dict(dicts)
+            except json.JSONDecodeError:
+                return []
+
+    def add_messages(self, messages: List[BaseMessage]) -> None:
+        current_messages = self.messages
+        current_messages.extend(messages)
+        with open(self.file_path, "w", encoding="utf-8") as f:
+            dicts = messages_to_dict(current_messages)
+            json.dump(dicts, f, indent=2)
+
+    def clear(self) -> None:
+        if os.path.exists(self.file_path):
+            os.remove(self.file_path)
+
+# --- FastAPI & Socket.IO App Initialization ---
+app = FastAPI(
+    title="RAG API Server with Per-User History",
+    description="An API for a multi-user document assistant that persists conversation history.",
+    version="2.2.0"
+)
+
+# Mount the 'static' directory to serve your HTML, CSS, and JS files.
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Initialize the Socket.IO server with CORS enabled for all origins for easier development.
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+# Combine the FastAPI and Socket.IO apps into one.
+socket_app = socketio.ASGIApp(sio, app)
+
+# In-memory cache for history objects to improve performance.
+store: Dict[str, BaseChatMessageHistory] = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = FileChatMessageHistory(session_id=session_id)
+    return store[session_id]
+
+# Wrap the LangChain chain with the history management logic.
+chain_with_history = RunnableWithMessageHistory(
+    original_chain,
+    get_session_history,
+    input_messages_key="question",
+    history_messages_key="chat_history",
+)
+
+# --- Socket.IO Event Handlers ---
+@sio.event
+async def connect(sid, environ):
+    print(f"New client connected: {sid}")
+
+@sio.event
+async def disconnect(sid):
+    print(f"Client disconnected: {sid}")
+    # Clean up from the in-memory cache on disconnect.
+    if sid in store:
+        del store[sid]
+        
+@sio.on("chat_request")
+async def handle_chat_request(sid, data: dict):
+    user_query = data.get("message")
+    if not user_query:
+        await sio.emit("error", {"message": "No message content found."}, to=sid)
+        return
+
+    print(f"Received query from {sid}: {user_query}")
+    
+    # 1. Use ainvoke to prevent blocking the async event loop
+    retrieved_docs = await retriever.ainvoke(user_query)
+    context = format_documents(retrieved_docs)
+
+    print(f"Invoking RAG chain for session {sid}...")
+    
+    # 2. Stream the response chunks as they arrive
+    full_response = ""
+    try:
+        async for chunk in chain_with_history.astream(
+            {"context": context, "question": user_query},
+            config={"configurable": {"session_id": sid}}
+        ):
+            # Each chunk is the incremental content
+            if isinstance(chunk, str):
+                content = chunk
+            elif isinstance(chunk, dict):
+                content = chunk.get("content", "") or chunk.get("answer", "") or str(chunk)
+            else:
+                content = str(chunk)
+            
+            full_response += content
+            
+            # Emit chunk to frontend in real-time
+            await sio.emit(
+                "chat_stream_chunk", 
+                {"chunk": content}, 
+                to=sid
+            )
+        
+        # Emit final completion signal
+        await sio.emit(
+            "chat_stream_complete",
+            {"total_response": full_response},
+            to=sid
+        )
+    except Exception as e:
+        print(f"Error streaming response: {e}")
+        await sio.emit("error", {"message": str(e)}, to=sid)
+
+# --- Standard FastAPI Endpoints ---
+@app.get("/")
+async def read_root():
+    """Serves the main index.html file for the chat interface."""
+    return FileResponse("templates/index.html")
+
+@app.get("/v1/history/{session_id}")
+def get_history(session_id: str):
+    """A utility endpoint to inspect the history file of a given session."""
+    history = FileChatMessageHistory(session_id=session_id)
+    return history.messages
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "server:socket_app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
