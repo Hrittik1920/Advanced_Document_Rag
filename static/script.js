@@ -14,7 +14,31 @@ document.addEventListener("DOMContentLoaded", () => {
         console.log("✅ Successfully connected to the server with SID:", socket.id);
     });
 
-    // --- 2. Listen for 'chat_response' from the server ---
+    // --- 2. Listen for streaming chunks from the server ---
+    let currentBotMessageElement = null;
+    
+    socket.on("chat_stream_chunk", (data) => {
+        if (!currentBotMessageElement) {
+            hideLoadingIndicator();
+            currentBotMessageElement = createBotMessageElement("");
+            chatBox.appendChild(currentBotMessageElement);
+        }
+        
+        const chunk = data.chunk || "";
+        appendChunkToBotMessage(currentBotMessageElement, chunk);
+        scrollToBottom();
+    });
+    
+    socket.on("chat_stream_end", (data) => {
+        if (currentBotMessageElement) {
+            currentBotMessageElement = null;
+        }
+        isRequestInProgress = false;
+        sendButton.disabled = false;
+        userInput.focus();
+    });
+    
+    // --- Legacy support for non-streaming responses ---
     socket.on("chat_response", (data) => {
         hideLoadingIndicator();
         appendMessage(data.content, "bot-message");
@@ -52,6 +76,37 @@ document.addEventListener("DOMContentLoaded", () => {
         handleSendMessage();
     });
 
+    /**
+     * Creates a bot message element.
+     */
+    function createBotMessageElement(content) {
+        const messageElement = document.createElement("div");
+        messageElement.classList.add("message", "bot-message");
+        
+        const container = document.createElement('div');
+        container.className = 'formatted-response';
+        container.dataset.rawContent = "";
+        messageElement.appendChild(container);
+        
+        return messageElement;
+    }
+    
+    /**
+     * Appends a chunk to the bot message and updates the formatted display.
+     */
+    function appendChunkToBotMessage(messageElement, chunk) {
+        const container = messageElement.querySelector('.formatted-response');
+        if (container) {
+            const currentRawContent = container.dataset.rawContent || "";
+            const newRawContent = currentRawContent + chunk;
+            container.dataset.rawContent = newRawContent;
+            
+            // Update the displayed markdown
+            const sanitizedText = newRawContent.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+            container.innerHTML = marked.parse(sanitizedText);
+        }
+    }
+    
     /**
      * Appends a message to the chat box.
      */

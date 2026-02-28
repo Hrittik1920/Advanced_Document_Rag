@@ -1,22 +1,25 @@
 import base64
 import aiohttp
+from typing import AsyncGenerator
 
 async def query_ollama(
     prompt: str, 
     model: str, 
     image_path: str = None, 
     keep_alive: int = 0,
-    base_url: str = "http://localhost:11434"
-) -> str:
+    base_url: str = "http://localhost:11434",
+    stream: bool = True
+) -> AsyncGenerator[str, None]:
     """
-    Asynchronously queries an Ollama Vision Language Model (VLM).
+    Asynchronously queries an Ollama Vision Language Model (VLM) with streaming support.
+    Yields response chunks as they arrive.
     """
     url = f"{base_url}/api/generate"
     
     payload = {
         "model": model,
         "prompt": prompt,
-        "stream": False,
+        "stream": stream,
         "keep_alive": f"{keep_alive}m" # Ollama accepts '0m', '5m', etc.
     }
     
@@ -28,22 +31,36 @@ async def query_ollama(
                 payload["images"] = [base64_image]
         except Exception as e:
             print(f"❌ Error encoding image for Ollama ({image_path}): {e}")
-            return ""
+            return
 
     # Execute the async request
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
-                    result = await response.json()
-                    return result.get("response", "").strip()
+                    if stream:
+                        # Stream mode: yield chunks as they arrive
+                        async for line in response.content:
+                            if line:
+                                try:
+                                    chunk = line.decode('utf-8')
+                                    import json
+                                    data = json.loads(chunk)
+                                    if 'response' in data:
+                                        yield data['response']
+                                except Exception as e:
+                                    print(f"Error parsing stream chunk: {e}")
+                    else:
+                        # Non-stream mode: return full response
+                        result = await response.json()
+                        yield result.get("response", "").strip()
                 else:
                     error_text = await response.text()
                     print(f"⚠️ Ollama API Error {response.status}: {error_text}")
-                    return ""
+                    yield ""
     except aiohttp.ClientConnectorError:
         print(f"❌ Failed to connect to Ollama. Is it running at {base_url}?")
-        return ""
+        yield ""
     except Exception as e:
         print(f"❌ Unexpected error querying Ollama: {e}")
-        return ""
+        yield ""
