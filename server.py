@@ -59,9 +59,10 @@ from script import format_documents, original_chain
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
+from config import settings
 
 # --- CONFIGURATION ---
-HISTORY_DIR = "chat_histories"
+HISTORY_DIR = settings.HISTORY_DIR
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
 # --- Custom Chat History Class for File Persistence ---

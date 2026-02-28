@@ -13,4 +13,5 @@ chat_histories/
 .webui_secret_key
 .vscode
 test_documents/
-venv/
+.env
+logs/
