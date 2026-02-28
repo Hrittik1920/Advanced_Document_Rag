@@ -1,0 +1,48 @@
+[10:32:06] 
+================ NEW REQUEST ================
+[10:32:06] Session: J32j_JJCMfQ6GU-LAAAJ
+[10:32:06] Question: Special conditions for Cable cutters
+[10:32:06] Retriever took 193.43 ms
+[10:32:06] Context formatting took 0.04 ms
+[10:32:06] ----- SESSION HISTORY -----
+[10:32:06] ----- END SESSION HISTORY -----
+[10:32:13] LLM inference took 6742.03 ms
+[10:32:13] Answer:
+[10:32:13] ### Assistant Response
+The special conditions for using cable cutters are:
+
+- **Use only standard, insulated cable cutters.**  
+- **Do not use sharp‑edge tools or cutters without handles** (e.g., hex blades).  
+- **Select the right tool for the job** to ensure safe and effective cutting.
+
+These rules help prevent electrical hazards and injuries during cable‑cutting tasks.
+
+---
+
+### Key Takeaways
+- **Insulated, standard cutters** must be used (context [1], page 33).  
+- **Sharp‑edge tools and non‑standard blades** (e.g., hex blades without handles) are prohibited.  
+- **Tool selection**: choose the appropriate tool for the specific cutting job.
+[10:32:14] Streaming took 1679.21 ms
+[10:32:14] [TOTAL] handle_chat_request took 8616.31 ms
+[10:32:54] 
+================ NEW REQUEST ================
+[10:32:54] Session: _xul3dYtM3neNtTFAAAJ
+[10:32:54] Question: Special conditions for Cable cutters
+[10:32:54] Retriever took 188.10 ms
+[10:32:54] Context formatting took 0.04 ms
+[10:32:54] ----- SESSION HISTORY -----
+[10:32:54] ----- END SESSION HISTORY -----
+[10:33:02] LLM inference took 7876.86 ms
+[10:33:02] Answer:
+[10:33:02] ### Assistant Response
+For cutting cables, the special condition is to **always use a standard, insulated cable cutter**. Sharp‑edged tools or hex blades without a handle are prohibited; the right, insulated tool must be selected for the job.
+
+---
+
+### Key Takeaways
+- **Use only standard, insulated cable cutters** for cable cutting tasks.  
+- **Avoid** sharp‑edged tools or hex blades that lack a handle.  
+- Ensure the correct, insulated tool is used to maintain safety and compliance.
+[10:33:04] Streaming took 1272.67 ms
+[10:33:04] [TOTAL] handle_chat_request took 9339.48 ms
