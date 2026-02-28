@@ -5,12 +5,13 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from data_loader import MultiFormatDocumentLoader
 from tqdm import tqdm # Import tqdm for the progress bar
+from config import settings
 
 # --- Configuration ---
-DOCUMENTS_DIRECTORY = "./test_documents"
+DOCUMENTS_DIRECTORY = settings.DOCUMENTS_DIR
 DB_LOCATION = "./chroma_langchain_db"
 FILE_HASH_DB = os.path.join(DB_LOCATION, "file_hashes.json")
-EMBEDDINGS = OllamaEmbeddings(model="qwen3-embedding:4b")
+EMBEDDINGS = OllamaEmbeddings(model=settings.LLM_EMBEDDING_MODEL)
 COLLECTION_NAME = "multi_format_documents"
 
 def get_file_hash(file_path):
@@ -90,7 +91,7 @@ def initialize_vector_store():
 # --- Main Execution ---
 vector_store = initialize_vector_store()
 retriever = vector_store.as_retriever(
-    search_kwargs={"k": 8}
+    search_kwargs={"k": 10}
 )
 
 print("Retriever is ready.")

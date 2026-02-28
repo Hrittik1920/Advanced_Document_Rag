@@ -4,9 +4,10 @@ from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from config import settings
 
 # --- Configuration ---
-MODEL_NAME = "codez-gpt"
+MODEL_NAME = settings.LLM_MODEL_NAME
 MAX_CONTEXT_CHARS = 8_000
 
 # --- Model ---
