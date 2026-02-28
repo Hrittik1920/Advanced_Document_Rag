@@ -7,7 +7,51 @@ from starlette.responses import FileResponse
 from typing import List, Dict
 import socketio
 import uvicorn
+import time
+import functools
+import inspect
+import logging
 
+from datetime import datetime
+
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+def get_today_log_file():
+    today = datetime.now().strftime("%d%m%Y")
+    return os.path.join(LOG_DIR, f"log{today}.txt")
+
+def timed(func):
+    @functools.wraps(func)
+    async def async_wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = await func(*args, **kwargs)
+        duration = (time.perf_counter() - start) * 1000
+        log_timing(f"[TOTAL] {func.__name__} took {duration:.2f} ms")
+        return result
+
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        duration = (time.perf_counter() - start) * 1000
+        log_timing(f"[TOTAL] {func.__name__} took {duration:.2f} ms")
+        return result
+
+    if inspect.iscoroutinefunction(func):
+        return async_wrapper
+    return sync_wrapper
+
+
+
+def log_timing(message: str):
+    log_file = get_today_log_file()
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+logger = logging.getLogger("timing_logger")
 # --- Your Existing RAG and LangChain Imports ---
 from vector import retriever
 # New, correct line
@@ -96,8 +140,13 @@ async def disconnect(sid):
         del store[sid]
         
 @sio.on("chat_request")
+@timed
 async def handle_chat_request(sid, data: dict):
     user_query = data.get("message")
+    total_start = time.perf_counter()
+    log_timing("\n================ NEW REQUEST ================")
+    log_timing(f"Session: {sid}")
+    log_timing(f"Question: {user_query}")
     if not user_query:
         await sio.emit("error", {"message": "No message content found."}, to=sid)
         return
@@ -105,8 +154,13 @@ async def handle_chat_request(sid, data: dict):
     print(f"Received query from {sid}: {user_query}")
     
     # 1. Use ainvoke to prevent blocking the async event loop
+    start = time.perf_counter()
     retrieved_docs = await retriever.ainvoke(user_query)
+    log_timing(f"Retriever took {(time.perf_counter() - start) * 1000:.2f} ms")
+
+    start = time.perf_counter()
     context = format_documents(retrieved_docs)
+    log_timing(f"Context formatting took {(time.perf_counter() - start) * 1000:.2f} ms")
     
     # Ensure context is never None/empty - use a default if needed
     if not context:
@@ -117,14 +171,25 @@ async def handle_chat_request(sid, data: dict):
     # 2. Get the full response using ainvoke (compatible with RunnableWithMessageHistory)
     full_response = ""
     try:
+        start = time.perf_counter()
+        history_obj = get_session_history(sid)
+
+        log_timing("----- SESSION HISTORY -----")
+        for msg in history_obj.messages:
+            log_timing(f"{msg.type.upper()}: {msg.content}")
+        log_timing("----- END SESSION HISTORY -----")
         response = await chain_with_history.ainvoke(
             {"context": context, "question": user_query},
             config={"configurable": {"session_id": sid}}
         )
+        log_timing(f"LLM inference took {(time.perf_counter() - start) * 1000:.2f} ms")
         full_response = response
+        log_timing("Answer:")
+        log_timing(full_response)
         
         # Stream the response in chunks to the client
         chunk_size = 20
+        start = time.perf_counter()
         for i in range(0, len(full_response), chunk_size):
             chunk = full_response[i:i + chunk_size]
             if chunk:
@@ -135,6 +200,7 @@ async def handle_chat_request(sid, data: dict):
                 )
                 # Small delay to create streaming effect
                 await asyncio.sleep(0.05)
+        log_timing(f"Streaming took {(time.perf_counter() - start) * 1000:.2f} ms")
         
         # Emit end-of-stream signal
         await sio.emit(
@@ -168,5 +234,5 @@ if __name__ == "__main__":
         "server:socket_app",
         host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=False,  # Set to True if you want auto-reload during development
     )
