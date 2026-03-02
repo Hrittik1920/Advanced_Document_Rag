@@ -12,6 +12,19 @@ MAX_CONTEXT_CHARS = 8_000
 
 # --- Model ---
 model = OllamaLLM(model=MODEL_NAME)
+# --- Condense Prompt (rewrites follow-up questions to be standalone) ---
+condense_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "Given the chat history and the latest user question, rewrite the question "
+        "as a fully self-contained, standalone question. "
+        "Do NOT answer it. Only rewrite it. If it's already standalone, return it as-is."
+    ),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
+])
+
+condense_chain = condense_prompt | model | StrOutputParser()
 
 # --- Prompt Template ---
 
