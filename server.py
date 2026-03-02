@@ -11,6 +11,7 @@ import time
 import functools
 import inspect
 import logging
+from script import format_documents, original_chain, condense_chain
 
 from datetime import datetime
 
@@ -154,9 +155,24 @@ async def handle_chat_request(sid, data: dict):
 
     print(f"Received query from {sid}: {user_query}")
     
-    # 1. Use ainvoke to prevent blocking the async event loop
+    # 0. Get history and condense the question for better retrieval
+    history_obj = get_session_history(sid)
+    chat_history = history_obj.messages
+
     start = time.perf_counter()
-    retrieved_docs = await retriever.ainvoke(user_query)
+    if chat_history:
+        standalone_question = await condense_chain.ainvoke({
+            "question": user_query,
+            "chat_history": chat_history,
+        })
+        log_timing(f"Condensed question: '{standalone_question}'")
+    else:
+        standalone_question = user_query
+    log_timing(f"Condense step took {(time.perf_counter() - start) * 1000:.2f} ms")
+
+    # 1. Use the CONDENSED question for retrieval
+    start = time.perf_counter()
+    retrieved_docs = await retriever.ainvoke(standalone_question)
     log_timing(f"Retriever took {(time.perf_counter() - start) * 1000:.2f} ms")
 
     start = time.perf_counter()
@@ -173,10 +189,10 @@ async def handle_chat_request(sid, data: dict):
     full_response = ""
     try:
         start = time.perf_counter()
-        history_obj = get_session_history(sid)
+        
 
         log_timing("----- SESSION HISTORY -----")
-        for msg in history_obj.messages:
+        for msg in chat_history:
             log_timing(f"{msg.type.upper()}: {msg.content}")
         log_timing("----- END SESSION HISTORY -----")
         response = await chain_with_history.ainvoke(
