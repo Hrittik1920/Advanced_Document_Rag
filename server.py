@@ -126,7 +126,7 @@ chain_with_history = RunnableWithMessageHistory(
     original_chain,
     get_session_history,
     input_messages_key="question",
-    history_messages_key="chat_history",
+    history_messages_key=HISTORY_DIR,
 )
 
 # --- Socket.IO Event Handlers ---
@@ -163,7 +163,7 @@ async def handle_chat_request(sid, data: dict):
     if chat_history:
         standalone_question = await condense_chain.ainvoke({
             "question": user_query,
-            "chat_history": chat_history,
+            settings.HISTORY_DIR: chat_history,
         })
         log_timing(f"Condensed question: '{standalone_question}'")
     else:
@@ -189,35 +189,33 @@ async def handle_chat_request(sid, data: dict):
     full_response = ""
     try:
         start = time.perf_counter()
-        
+        history_obj = get_session_history(sid)
 
         log_timing("----- SESSION HISTORY -----")
-        for msg in chat_history:
+        for msg in history_obj.messages:
             log_timing(f"{msg.type.upper()}: {msg.content}")
         log_timing("----- END SESSION HISTORY -----")
-        response = await chain_with_history.ainvoke(
+        
+        # Use .astream() instead of .ainvoke()
+        async for chunk in chain_with_history.astream(
             {"context": context, "question": user_query},
             config={"configurable": {"session_id": sid}}
-        )
-        log_timing(f"LLM inference took {(time.perf_counter() - start) * 1000:.2f} ms")
-        full_response = response
-        log_timing("Answer:")
-        log_timing(full_response)
-        
-        # Stream the response in chunks to the client
-        chunk_size = 20
-        start = time.perf_counter()
-        for i in range(0, len(full_response), chunk_size):
-            chunk = full_response[i:i + chunk_size]
-            if chunk:
+        ):
+            # Depending on your chain setup, the chunk might be a string or an AIMessageChunk
+            chunk_text = chunk if isinstance(chunk, str) else chunk.content
+            full_response += chunk_text
+            
+            if chunk_text:
                 await sio.emit(
                     "chat_stream_chunk", 
-                    {"chunk": chunk}, 
+                    {"chunk": chunk_text}, 
                     to=sid
                 )
-                # Small delay to create streaming effect
-                await asyncio.sleep(0.05)
-        log_timing(f"Streaming took {(time.perf_counter() - start) * 1000:.2f} ms")
+                # Notice: No asyncio.sleep() needed! The speed is naturally dictated by the LLM's inference speed.
+
+        log_timing(f"LLM streaming & inference took {(time.perf_counter() - start) * 1000:.2f} ms")
+        log_timing("Answer:")
+        log_timing(full_response)
         
         # Emit end-of-stream signal
         await sio.emit(

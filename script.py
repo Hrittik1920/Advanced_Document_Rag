@@ -5,13 +5,14 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from config import settings
+from llm_clients import query_ollama
 
 # --- Configuration ---
 MODEL_NAME = settings.LLM_MODEL_NAME
 MAX_CONTEXT_CHARS = 8_000
-
+HISTORY_KEY = settings.HISTORY_DIR
 # --- Model ---
-model = OllamaLLM(model=MODEL_NAME)
+model =OllamaLLM(model=MODEL_NAME, streaming=True)
 # --- Condense Prompt (rewrites follow-up questions to be standalone) ---
 condense_prompt = ChatPromptTemplate.from_messages([
     (
@@ -20,7 +21,7 @@ condense_prompt = ChatPromptTemplate.from_messages([
         "as a fully self-contained, standalone question. "
         "Do NOT answer it. Only rewrite it. If it's already standalone, return it as-is."
     ),
-    MessagesPlaceholder(variable_name="chat_history"),
+    MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
     ("human", "{question}"),
 ])
 
@@ -45,7 +46,7 @@ prompt = ChatPromptTemplate.from_messages([
         "- For simple greetings, provide only the 'Assistant Response' part without the 'Key Takeaways' or the separator.\n"
         "CONTEXT:\n---\n{context}\n---"
     ),
-    MessagesPlaceholder(variable_name="chat_history"),
+    MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
     ("human", "{question}"),
 ])
 
@@ -73,9 +74,11 @@ def format_documents(docs: list) -> str:
 # This is the 'original_chain' that server.py will import.
 # It is NOT wrapped with RunnableWithMessageHistory.
 original_chain = (
-    RunnablePassthrough.assign(
-        # The 'context' is passed in from server.py, so we just pass it through
-    )
+    {
+        "context": lambda x: x["context"],
+        "question": lambda x: x["question"],
+        HISTORY_KEY: lambda x: x[HISTORY_KEY]
+    }
     | prompt
     | model
     | StrOutputParser()
