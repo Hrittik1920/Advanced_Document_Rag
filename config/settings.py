@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     LLM_EMBEDDING_MODEL: str
     DOCUMENTS_DIR: str
     HISTORY_DIR: str
+    CROSS_ENCODER_MODEL: str
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8"
