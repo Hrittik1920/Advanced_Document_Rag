@@ -652,7 +652,7 @@
             let isRequestInProgress = false;
 
             // --- Real Socket Connection Logic ---
-            const socket = io("http://178.63.15.33:8099");
+            const socket = io("http://178.63.15.33:8000");
 
             socket.on("connect", () => {
                 console.log("Connected to server:", socket.id);

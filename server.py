@@ -12,6 +12,7 @@ import functools
 import inspect
 import logging
 import warnings
+import sys
 warnings.filterwarnings("ignore", category=FutureWarning)
 from script import format_documents, original_chain, condense_chain
 
@@ -87,12 +88,26 @@ class FileChatMessageHistory(BaseChatMessageHistory):
         with open(self.file_path, "r", encoding="utf-8") as f:
             try:
                 dicts = json.load(f)
-                return messages_from_dict(dicts)
+                all_messages = messages_from_dict(dicts)
+                all_messages = all_messages[-6:]
+                for msg in all_messages:
+                    if hasattr(msg, "content") and isinstance(msg.content, str):
+                        msg.content = msg.content.strip()[:300]
+                return all_messages
             except json.JSONDecodeError:
                 return []
 
     def add_messages(self, messages: List[BaseMessage]) -> None:
-        current_messages = self.messages
+        # current_messages = self.messages
+        if not os.path.exists(self.file_path):
+            current_messages = []
+        else:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                try:
+                    dicts = json.load(f)
+                    current_messages = messages_from_dict(json.load(f))
+                except json.JSONDecodeError:
+                    current_messages = []
         current_messages.extend(messages)
         with open(self.file_path, "w", encoding="utf-8") as f:
             dicts = messages_to_dict(current_messages)
@@ -231,9 +246,14 @@ def get_history(session_id: str):
     return history.messages
 
 if __name__ == "__main__":
+    port=8000
+    reload_flag=False
+    if "dev" in sys.argv:
+        port=8099
+        reload_flag=True
     uvicorn.run(
         "server:socket_app",
         host="0.0.0.0",
-        port=8099,
-        reload=False,  # Set to True if you want auto-reload during development
+        port=port,
+        reload=reload_flag,  # Set to True if you want auto-reload during development
     )

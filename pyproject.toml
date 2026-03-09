@@ -1,5 +1,5 @@
 [project]
-name = "document-openwebui-ollama-rag"
+name = "sankalp-document-chatbot"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
