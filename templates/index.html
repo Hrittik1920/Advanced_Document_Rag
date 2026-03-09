@@ -2,36 +2,1049 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RAG Chat Assistant</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Modern RAG Chat Assistant</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        :root {
+            --background-color: #f4f7f6;
+            --chat-container-bg: #ffffff;
+            --header-bg: #009688;
+            --header-text: #ffffff;
+            --user-message-bg: #009688;
+            --user-message-text: #ffffff;
+            --bot-message-bg: #ffffff;
+            --bot-message-text: #1c1e21;
+            --input-bg: #ffffff;
+            --border-color: #e8ebea;
+            --shadow-color: rgba(0, 0, 0, 0.06);
+            --accent-soft: rgba(0, 150, 136, 0.08);
+            --transition-speed: 0.2s;
+        }
+
+        * {
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--background-color);
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            height: -webkit-fill-available;
+            color: #333;
+            overflow: hidden;
+        }
+
+        .chat-container {
+            width: 100%;
+            max-width: 1100px;
+            height: 92vh;
+            background-color: var(--chat-container-bg);
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.1);
+            border-radius: 20px;
+            overflow: hidden;
+            margin: 20px;
+            position: relative;
+        }
+
+        @media (max-width: 768px) {
+            .chat-container {
+                height: 100vh;
+                margin: 0;
+                border-radius: 0;
+            }
+        }
+
+        .chat-header {
+            background-color: var(--header-bg);
+            color: var(--header-text);
+            padding: 20px 28px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            z-index: 10;
+        }
+
+        .chat-header h1 {
+            margin: 0;
+            font-size: 1.4rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+        }
+
+        .chat-header p {
+            margin: 6px 0 0;
+            font-size: 0.85rem;
+            opacity: 0.85;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .chat-box {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            background: #fdfdfd;
+            scrollbar-width: thin;
+        }
+
+        .chat-box::-webkit-scrollbar { width: 6px; }
+        .chat-box::-webkit-scrollbar-thumb { background-color: #e0e0e0; border-radius: 10px; }
+
+        /* Message Bubbles */
+        .message {
+            max-width: 85%;
+            padding: 14px 20px;
+            font-size: 0.98rem;
+            line-height: 1.6;
+            position: relative;
+            animation: slideIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(15px) scale(0.98); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .user-message {
+            align-self: flex-end;
+            background-color: var(--user-message-bg);
+            color: var(--user-message-text);
+            border-radius: 20px 20px 4px 20px;
+            box-shadow: 0 4px 12px rgba(0, 150, 136, 0.15);
+        }
+
+        .bot-message {
+            align-self: flex-start;
+            background-color: var(--bot-message-bg);
+            color: var(--bot-message-text);
+            border: 1px solid var(--border-color);
+            border-radius: 20px 20px 20px 4px;
+            box-shadow: 0 2px 8px var(--shadow-color);
+        }
+
+        /* Locate near other message styles */
+        /* Add to your existing <style> tag */
+        .stop-mode {
+            background-color: #dc3545 !important; /* Red color when in stop mode */
+        }
+
+        /* Container for the side-by-side layout */
+        .message-wrapper {
+            display: flex;
+            flex-direction: row; 
+            align-items: flex-start; 
+            margin-bottom: 24px;
+            width: 100%;
+            position: relative;
+        }
+
+        /* RIGHT SIDE: User message alignment */
+        .user-wrapper {
+            justify-content: flex-end;
+        }
+
+        /* LEFT SIDE: Bot message alignment */
+        .bot-wrapper {
+            justify-content: flex-start;
+        }
+
+        /* Modern Copy Button */
+        .copy-btn {
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            padding: 8px;
+            margin-right: 8px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+        }
+
+        /* Modern Hover Effect with Teal Tone */
+        .copy-btn:hover {
+            background-color: rgba(0, 150, 136, 0.1); /* Very soft teal glow */
+            transform: translateY(-1px);
+        }
+
+        .copy-btn:active {
+            transform: scale(0.9);
+        }
+
+        /* Tooltip with Teal matching UI */
+        .copy-btn::after {
+            content: "Copy";
+            position: absolute;
+            top: -30px;
+            left: 50%;
+            transform: translateX(-50%) scale(0.8);
+            background: #009688; /* Match your UI teal */
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            opacity: 0;
+            pointer-events: none;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .copy-btn:hover::after {
+            opacity: 1;
+            transform: translateX(-50%) scale(1);
+        }
+
+        .copy-icon-svg {
+            width: 18px;
+            height: 18px;
+            fill: #747775;
+            transition: fill 0.2s;
+        }
+
+        /* Hover icon turns Teal */
+        .copy-btn:hover .copy-icon-svg {
+            fill: #009688; 
+        }
+
+        .message {
+            max-width: 75%;
+            box-shadow: 0 2px 5px var(--shadow-color);
+        }
+
+        .user-message {
+            position: relative; /* Context for the absolute button */
+        }
+        .message-header { display: flex; justify-content: space-between; align-items: flex-start; }
+
+        /* Formatted Response Styling */
+        .formatted-response {
+            word-wrap: break-word;
+        }
+
+        /* Modern Headers for Sections */
+        .formatted-response h1, 
+        .formatted-response h2, 
+        .formatted-response h3 {
+            color: #111;
+            margin: 24px 0 12px 0;
+            font-weight: 600;
+            line-height: 1.3;
+        }
+
+        .formatted-response h3 {
+            font-size: 1.15rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--header-bg);
+        }
+
+        .formatted-response h3::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--border-color);
+            margin-left: 10px;
+        }
+
+        .formatted-response p {
+            margin: 0 0 16px 0;
+        }
+
+        .formatted-response hr {
+            border: none;
+            border-top: 1px solid var(--border-color);
+            margin: 24px 0;
+        }
+
+        /* List Styling */
+        .formatted-response ul, 
+        .formatted-response ol {
+            padding-left: 0;
+            margin: 0 0 16px 0;
+            list-style: none;
+        }
+
+        .formatted-response li {
+            position: relative;
+            padding-left: 26px;
+            margin-bottom: 10px;
+        }
+
+        .formatted-response ul li::before {
+            content: '•';
+            position: absolute;
+            left: 8px;
+            color: var(--header-bg);
+            font-weight: bold;
+            font-size: 1.2rem;
+            line-height: 1;
+        }
+
+        .formatted-response ol {
+            counter-reset: custom-counter;
+        }
+
+        .formatted-response ol li {
+            counter-increment: custom-counter;
+        }
+
+        .formatted-response ol li::before {
+            content: counter(custom-counter) ".";
+            position: absolute;
+            left: 0;
+            color: var(--header-bg);
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        /* Code and Preblocks */
+        .formatted-response code {
+            background: var(--accent-soft);
+            color: #00695c;
+            padding: 2px 6px;
+            border-radius: 6px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.9em;
+        }
+
+        .formatted-response pre {
+            background: #2d3436;
+            color: #dfe6e9;
+            padding: 16px;
+            border-radius: 12px;
+            overflow-x: auto;
+            margin: 16px 0;
+            font-size: 0.85rem;
+        }
+
+        /* Input Area */
+        .chat-input-area {
+            padding: 20px 28px;
+            background-color: var(--chat-container-bg);
+            border-top: 1px solid var(--border-color);
+        }
+
+        #chat-form {
+            display: flex;
+            gap: 14px;
+            align-items: center;
+        }
+
+        #user-input {
+            flex: 1;
+            padding: 12px 24px;
+            border: 1px solid var(--border-color);
+            background-color: #f8faf9;
+            border-radius: 24px; /* Slightly less than 30px looks better for textareas */
+            font-size: 1rem;
+            outline: none;
+            transition: all var(--transition-speed);
+            resize: none;         /* Hides the manual resize handle */
+            overflow-y: hidden;  /* Hides scrollbar until max-height reached */
+            font-family: inherit;
+            line-height: 1.5;
+            max-height: 150px;    /* Prevents it from covering the whole screen */
+            display: block;
+            transition: height 0.2s ease-in-out, background-color var(--transition-speed);
+        }
+
+        #user-input:focus {
+            background-color: #fff;
+            border-color: var(--header-bg);
+            box-shadow: 0 0 0 4px var(--accent-soft);
+        }
+
+        #send-button {
+            background-color: var(--header-bg);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 52px;
+            height: 52px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            flex-shrink: 0;
+            box-shadow: 0 4px 10px rgba(0, 150, 136, 0.3);
+        }
+
+        #send-button:hover:not(:disabled) {
+            background-color: #00796b;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 15px rgba(0, 150, 136, 0.4);
+        }
+
+        #send-button:active:not(:disabled) {
+            transform: translateY(0);
+        }
+
+        #send-button svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        #send-button:disabled {
+            background-color: #cfd8dc;
+            box-shadow: none;
+            cursor: not-allowed;
+        }
+
+        /* Loading Dots */
+        .loading-indicator {
+            display: flex;
+            gap: 5px;
+            padding: 16px 24px;
+        }
+
+        .loading-indicator span {
+            width: 9px;
+            height: 9px;
+            background-color: #009688;
+            opacity: 0.4;
+            border-radius: 50%;
+            animation: pulse 1.4s infinite ease-in-out both;
+        }
+
+        .loading-indicator span:nth-child(1) { animation-delay: -0.32s; }
+        .loading-indicator span:nth-child(2) { animation-delay: -0.16s; }
+
+        @keyframes pulse {
+            0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+            40% { transform: scale(1.1); opacity: 1; }
+        }
+
+        @keyframes fadeInGreeting {
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        /* Enhanced Username Styling */
+        /* Simple & Integrated Username Styling */
+        .user-name-highlight {
+            color: var(--header-bg); /* Uses your existing teal color */
+            font-weight: 600;
+            text-transform: capitalize;
+            font-family: inherit; /* Forces it to use 'Inter' from the body */
+        }
+
+        .greeting-text {
+            font-family: inherit;
+            line-height: 1.6;
+        }
+        .chat-header {
+            background-color: var(--header-bg);
+            color: var(--header-text);
+            padding: 24px 28px; /* Tighter vertical padding for a pro look */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* 1. The Rounded Rectangle (White Background) */
+        .siemens-logo-wrapper {
+            background-color: #ffffff;
+            padding: 6px 13px;
+            border-radius: 4px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .siemens-text {
+            color: #009688;               
+            font-family: 'Inter', sans-serif;
+            font-weight: 900;             /* Base heavy weight */
+            font-size: 1.15rem;            
+            letter-spacing: 0.16em;       /* Professional wide spacing */
+            text-transform: uppercase;
+            line-height: 1;
+            user-select: none;
+            cursor: default;
+
+            /* THE "SMALL BIT" EXTRA BOLD: Just a tiny 0.5px outline */
+            -webkit-text-stroke: 0.5px #009688; 
+            
+            /* Ensures the thin stroke stays sharp */
+            text-rendering: optimizeLegibility;
+            -webkit-font-smoothing: antialiased;
+        }
+        .stopped-notice {
+            font-size: 0.75rem;
+            color: #666;
+            margin-top: 4px;
+            font-style: italic;
+            display: block;
+            clear: both;
+        }
+        /* Container for bubble + buttons */
+        .bot-message-wrapper {
+            display: flex;
+            flex-direction: column; /* Bubble top, buttons bottom */
+            align-items: flex-start;
+            margin-bottom: 24px;
+            width: 100%;
+        }
+
+        /* Bot control row styling */
+        .bot-controls {
+            display: flex;
+            flex-direction: row; /* Horizontal */
+            gap: 8px;
+            margin-top: 4px;
+            margin-left: 12px;
+        }
+
+        /* Make bot buttons look like the user copy button */
+        .bot-control-btn {
+            background: none;
+            border: none;
+            padding: 5px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        .bot-control-btn:hover {
+            background-color: rgba(0, 0, 0, 0.05);
+        }
+
+        .bot-control-btn svg {
+            width: 20px;
+            height: 20px;
+            fill: #5f6368; /* Matches standard icon grey */
+        }
+        /* PDF Preview Modal Styles */
+        .pdf-modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            backdrop-filter: blur(4px);
+            justify-content: center;
+            align-items: center;
+        }
+
+        .pdf-modal-content {
+            background-color: white;
+            width: 90%;
+            max-width: 800px;
+            height: 80vh;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .pdf-modal-header {
+            padding: 15px 20px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .pdf-modal-body {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            font-family: 'Inter', sans-serif;
+            line-height: 1.6;
+            color: #333;
+        }
+
+        .pdf-modal-footer {
+            padding: 15px 20px;
+            border-top: 1px solid #eee;
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        .modal-btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-weight: 500;
+        }
+
+        .modal-download-btn { background: #009688; color: white; }
+        .modal-close-btn { background: #e0e0e0; color: #333; }
+    </style>
 </head>
 <body>
     <div class="chat-container">
         <header class="chat-header">
-            <h1>Chat Assistant</h1>
-            <p>Powered by Llama, FastAPI & LangChain</p>
-        </header>
-        <main class="chat-box" id="chat-box">
-            <!-- Chat messages will be appended here -->
-            <div class="message bot-message">
-                <p>Hello! How can I help you today?</p>
+            <h1>Sankalp AI Chat Assistant</h1>
+            <div class="siemens-logo-wrapper">
+                <div class="siemens-text">SIEMENS</div>
             </div>
+        </header>
+        
+        <main class="chat-box" id="chat-box">
         </main>
+        
         <footer class="chat-input-area">
             <form id="chat-form">
-                <input type="text" id="user-input" placeholder="Type your message here..." autocomplete="off">
-                <button type="submit" id="send-button">
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon">
+                <textarea id="user-input" placeholder="Ask me anything..." autocomplete="off" rows="1"></textarea>
+                <button type="submit" id="send-button" class="send-button">
+                    <svg id="send-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" style="width:20px; height:20px;">
                         <path d="M3.478 2.405a.75.75 0 00-.926.94l2.432 7.905H13.5a.75.75 0 010 1.5H4.984l-2.432 7.905a.75.75 0 00.926.94 60.519 60.519 0 0018.445-8.986.75.75 0 000-1.218A60.517 60.517 0 003.478 2.405z" />
+                    </svg>
+                    <svg id="stop-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" style="width:20px; height:20px; display:none;">
+                        <path fill-rule="evenodd" d="M4.5 7.5a3 3 0 013-3h9a3 3 0 013 3v9a3 3 0 01-3 3h-9a3 3 0 01-3-3v-9z" clip-rule="evenodd" />
                     </svg>
                 </button>
             </form>
         </footer>
     </div>
-    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="/static/script.js"></script>
+    <div id="pdfModal" class="pdf-modal">
+        <div class="pdf-modal-content">
+            <div class="pdf-modal-header">
+                <h3 style="margin:0; font-size:1.1rem;">Document Preview</h3>
+                <span id="closeModal" style="cursor:pointer; font-size:1.5rem;">&times;</span>
+            </div>
+            <div id="pdfPreviewBody" class="pdf-modal-body"></div>
+            <div class="pdf-modal-footer">
+                <button class="modal-btn modal-close-btn" id="cancelModal">Close</button>
+                <button class="modal-btn modal-download-btn" id="downloadPdfBtn">Download PDF</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const chatForm = document.getElementById("chat-form");
+            const userInput = document.getElementById("user-input");
+            const chatBox = document.getElementById("chat-box");
+            const sendButton = document.getElementById("send-button");
+
+            let isRequestInProgress = false;
+
+            // --- Real Socket Connection Logic ---
+            const socket = io("http://178.63.15.33:8099");
+
+            socket.on("connect", () => {
+                console.log("Connected to server:", socket.id);
+            });
+
+            let currentBotMessageElement = null;
+
+            socket.on("chat_stream_chunk", (data) => {
+                if (!currentBotMessageElement) {
+                    hideLoadingIndicator();
+                    currentBotMessageElement = createBotMessageElement();
+                    chatBox.appendChild(currentBotMessageElement);
+                }
+                appendChunkToBotMessage(currentBotMessageElement, data.chunk || "");
+                scrollToBottom();
+            });
+
+            socket.on("chat_stream_end", () => {
+                // Reveal the controls for the finished message
+                if (currentBotMessageElement) {
+                    const controls = currentBotMessageElement.querySelector(".bot-controls");
+                    if (controls) controls.style.display = "flex";
+                }
+                currentBotMessageElement = null;
+                resetInputState();
+            });
+
+            socket.on("chat_response", (data) => {
+                hideLoadingIndicator();
+                appendMessage(data.content, "bot-message");
+                resetInputState();
+            });
+
+            socket.on("error", (data) => {
+                hideLoadingIndicator();
+                appendMessage(`Error: ${data.message}`, "bot-message");
+                resetInputState();
+            });
+
+            socket.on("chat_stopped_manually", () => {
+                hideLoadingIndicator();
+                
+                let targetElement = currentBotMessageElement;
+                if (!targetElement) {
+                    targetElement = createBotMessageElement();
+                    chatBox.appendChild(targetElement);
+                }
+                
+                addStoppedText(targetElement);
+                
+                // Show buttons for the partial response
+                const controls = targetElement.querySelector(".bot-controls");
+                if (controls) controls.style.display = "flex";
+                
+                currentBotMessageElement = null;
+                resetInputState();
+                scrollToBottom();
+            });
+
+            // --- Handlers ---
+            function resetInputState() {
+                isRequestInProgress = false;
+                sendButton.disabled = false;
+                userInput.focus();
+            }
+
+            const handleSendMessage = (e) => {
+                if (e) e.preventDefault();
+                
+                // If already processing, Clicking the button now STOPS the process
+                if (isRequestInProgress) {
+                    socket.emit("stop_generation"); // Signal backend to kill the task
+                    resetInputState();
+                    return;
+                }
+                
+                const text = userInput.value.trim();
+                if (!text) return;
+
+                isRequestInProgress = true;
+                toggleButtonState(true); // Switch to Stop Icon
+                
+                appendMessage(text, "user-message");
+                userInput.value = "";
+
+                // --- ADD THESE TWO LINES HERE ---
+                userInput.value = "";             // Clear text
+                userInput.style.height = '54px';  // Instant shrink to default height
+                // --------------------------------
+
+                showLoadingIndicator();
+
+                socket.emit("chat_request", { message: text });
+            };
+
+            function toggleButtonState(processing) {
+                const sendIcon = document.getElementById('send-icon');
+                const stopIcon = document.getElementById('stop-icon');
+                if (processing) {
+                    sendIcon.style.display = 'none';
+                    stopIcon.style.display = 'block';
+                    sendButton.classList.add('stop-mode');
+                } else {
+                    sendIcon.style.display = 'block';
+                    stopIcon.style.display = 'none';
+                    sendButton.classList.remove('stop-mode');
+                }
+            }
+
+            // Update your existing resetInputState to also toggle icons back
+            function resetInputState() {
+                isRequestInProgress = false;
+                sendButton.disabled = false;
+                toggleButtonState(false); // Switch back to Send Icon
+                userInput.focus();
+            }
+
+            chatForm.addEventListener("submit", handleSendMessage);
+
+            function createBotMessageElement() {
+                const containerWrapper = document.createElement("div");
+                containerWrapper.style.display = "flex";
+                containerWrapper.style.flexDirection = "column";
+
+                // 1. Message Bubble
+                const msgDiv = document.createElement("div");
+                msgDiv.className = "message bot-message";
+                const textDiv = document.createElement("div");
+                textDiv.className = "formatted-response";
+                textDiv.dataset.raw = "";
+                msgDiv.appendChild(textDiv);
+
+                // 2. Horizontal Button Row
+                const controls = document.createElement("div");
+                controls.className = "bot-controls";
+                controls.style.display = "none"; // <-- ADD THIS LINE TO HIDE INITIALLY
+
+                // Create Icons
+                const docIcon = `<svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>`;
+                const pdfIcon = `<svg viewBox="0 0 24 24"><path d="M20 2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8.5 7.5c0 .83-.67 1.5-1.5 1.5H9v2H7.5V7H10c.83 0 1.5.67 1.5 1.5v1zm5 2c0 .83-.67 1.5-1.5 1.5h-2.5V7H15c.83 0 1.5.67 1.5 1.5v3zm4-3H19v1h1.5V11H19v2h-1.5V7h3v1.5zM9 9.5h1v-1H9v1zM14 11h1v-2.5h-1V11zM4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6z"/></svg>`;
+
+                // Copy Button (Matching User Style & Functionality)
+                const copyBtn = document.createElement("button");
+                copyBtn.className = "bot-control-btn copy-btn copy-btn-bot"; // Added 'copy-btn' for hover effects
+                copyBtn.setAttribute("aria-label", "Copy message");
+                copyBtn.innerHTML = `
+                    <svg class="copy-icon-svg" viewBox="0 0 24 24">
+                        <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+                    </svg>`;
+                
+                // Essential fix: assign the click handler here
+                copyBtn.onclick = () => {
+                    const textToCopy = textDiv.innerText || textDiv.textContent;
+                    copyToClipboard(textToCopy, copyBtn);
+                };
+
+                // Save Doc
+                const docBtn = document.createElement("button");
+                docBtn.className = "bot-control-btn";
+                docBtn.innerHTML = docIcon;
+                docBtn.onclick = () => {
+                    const blob = new Blob([textDiv.innerText], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `chat_doc_${Date.now()}.txt`;
+                    a.click();
+                };
+
+                // Save PDF
+                // Updated PDF Button: Opens Pop-up Preview
+                const pdfBtn = document.createElement("button");
+                pdfBtn.className = "bot-control-btn";
+                pdfBtn.innerHTML = pdfIcon;
+                pdfBtn.onclick = () => {
+                    const modal = document.getElementById("pdfModal");
+                    const previewBody = document.getElementById("pdfPreviewBody");
+                    const downloadBtn = document.getElementById("downloadPdfBtn");
+
+                    // Set the content in the preview
+                    previewBody.innerHTML = textDiv.innerHTML;
+                    modal.style.display = "flex";
+
+                    // Download Logic inside the popup
+                    downloadBtn.onclick = () => {
+                        const printWindow = window.open('', '_blank');
+                        printWindow.document.write(`<html><head><title>Download</title><style>body{font-family:Inter,sans-serif;padding:20px;}</style></head><body>${textDiv.innerHTML}</body></html>`);
+                        printWindow.document.close();
+                        printWindow.print();
+                    };
+                };
+
+                controls.append(copyBtn, docBtn, pdfBtn);
+                containerWrapper.append(msgDiv, controls);
+
+                return containerWrapper;
+            }
+
+            function appendChunkToBotMessage(element, chunk) {
+                // Find the text container within the wrapper
+                const container = element.querySelector(".formatted-response");
+                const newRaw = (container.dataset.raw || "") + chunk;
+                container.dataset.raw = newRaw;
+                container.innerHTML = marked.parse(newRaw.replace(/\\n/g, '\n'));
+            }
+
+            function appendMessage(content, className) {
+                const wrapper = document.createElement("div");
+                wrapper.className = `message-wrapper ${className === "user-message" ? "user-wrapper" : "bot-wrapper"}`;
+
+                const copyIconHTML = `
+                    <svg class="copy-icon-svg" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+                    </svg>`;
+
+                const copyBtn = document.createElement("button");
+                copyBtn.className = "copy-btn";
+                copyBtn.setAttribute("aria-label", "Copy message");
+                copyBtn.innerHTML = copyIconHTML;
+
+                const div = document.createElement("div");
+                div.classList.add("message", className);
+
+                if (className === "user-message") {
+                    div.textContent = content;
+                    copyBtn.onclick = () => copyToClipboard(content, copyBtn);
+                    
+                    wrapper.appendChild(copyBtn);
+                    wrapper.appendChild(div);
+                    chatBox.appendChild(wrapper);
+                } else {
+                    // --- BOT STRUCTURE ---
+                    const botElementWrapper = createBotMessageElement(); 
+                    botElementWrapper.classList.remove("bot-message-wrapper");
+                    
+                    // Show buttons immediately for non-streaming messages
+                    const controls = botElementWrapper.querySelector(".bot-controls");
+                    if (controls) controls.style.display = "flex";
+
+                    appendChunkToBotMessage(botElementWrapper, content);
+                    chatBox.appendChild(botElementWrapper);
+                }
+                
+                scrollToBottom();
+            }
+
+            // Updated Copy Function for your specific Teal UI
+            function copyToClipboard(text, btnElement) {
+                const originalSVG = btnElement.innerHTML;
+                
+                const showSuccess = () => {
+                    // Updated checkmark to use your UI teal color
+                    btnElement.innerHTML = '<span style="color:#009688; font-size:14px; font-weight:bold;">✓</span>';
+                    setTimeout(() => { 
+                        btnElement.innerHTML = originalSVG; 
+                    }, 2000);
+                };
+
+                // Standard fallback logic (Required for HTTP)
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(text).then(showSuccess);
+                } else {
+                    const textArea = document.createElement("textarea");
+                    textArea.value = text;
+                    textArea.style.position = "fixed";
+                    textArea.style.left = "-9999px";
+                    document.body.appendChild(textArea);
+                    textArea.focus();
+                    textArea.select();
+                    try {
+                        document.execCommand('copy');
+                        showSuccess();
+                    } catch (err) {
+                        console.error("Copy failed", err);
+                    }
+                    document.body.removeChild(textArea);
+                }
+            }
+
+            // Update the Stopped Text logic to be at the lower left
+            function addStoppedText(element) {
+                if (element.querySelector('.stopped-notice')) return;
+                
+                const stopMsg = document.createElement("span");
+                stopMsg.className = "stopped-notice";
+                stopMsg.style.cssText = "font-size: 1rem; margin-top: 5px; display: block;";
+                stopMsg.textContent = "You stop this response";
+                
+                // Append to the outer wrapper of the bot message
+                element.appendChild(stopMsg);
+            }
+
+            function showLoadingIndicator() {
+                const loader = document.createElement("div");
+                loader.classList.add("message", "bot-message", "loading-indicator");
+                loader.id = "loading-indicator";
+                loader.innerHTML = `<span></span><span></span><span></span>`;
+                chatBox.appendChild(loader);
+                scrollToBottom();
+            }
+
+            function hideLoadingIndicator() {
+                const loader = document.getElementById("loading-indicator");
+                if (loader) loader.remove();
+            }
+
+            function scrollToBottom() {
+                chatBox.scrollTo({
+                    top: chatBox.scrollHeight,
+                    behavior: 'smooth'
+                });
+            }
+
+            // 1. Handle Key Logic (Enter to send, Shift+Enter for new line)
+            const userInputField = document.getElementById("user-input");
+
+            userInputField.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault(); // Stop the new line from being added
+                    chatForm.dispatchEvent(new Event('submit')); // Trigger your existing send function
+                }
+                // Shift+Enter will naturally create a new line because we didn't call preventDefault()
+            });
+
+            // 2. Handle Auto-Resize (Grows as you type)
+            userInputField.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = (this.scrollHeight) + 'px';
+                
+                // Toggle scrollbar if it hits max-height
+                if (this.scrollHeight > 150) {
+                    this.style.overflowY = 'auto';
+                } else {
+                    this.style.overflowY = 'hidden';
+                }
+            });
+
+            function resetInputState() {
+                isRequestInProgress = false;
+                sendButton.disabled = false;
+                toggleButtonState(false); // Switch back to Send Icon
+                
+                userInput.value = "";
+                userInput.style.height = '54px'; // Forces height back to default (approx 1 row)
+                userInput.focus();
+            }
+
+            // --- LOGIC TO SHOW THE INITIAL MESSAGE ---
+            function showInitialGreeting() {
+                const params = new URLSearchParams(window.location.search);
+                const userName = params.get('username');
+                
+                let greetingHTML;
+
+                if (userName) {
+                    // Clean capitalization: shubham -> Shubham
+                    const formattedName = userName.toLowerCase().replace(/\b\w/g, char => char.toUpperCase());
+                    greetingHTML = `Hello <span class="user-name-highlight">${formattedName}</span>! How can I help you today?`;
+                } else {
+                    greetingHTML = `Hello! How can I help you today?`;
+                }
+
+                // This function creates the <div> structure "in memory"
+                const element = createBotMessageElement(); 
+                
+                // Now we find the .formatted-response inside that "memory" element
+                const container = element.querySelector(".formatted-response");
+                
+                // Put our text inside it
+                container.innerHTML = greetingHTML;
+                
+                // Finally, push it to the actual chat-box on the screen
+                chatBox.appendChild(element);
+                scrollToBottom();
+            }
+
+            // Logic to close the PDF Modal
+            const modal = document.getElementById("pdfModal");
+            const closeX = document.getElementById("closeModal");
+            const closeBtn = document.getElementById("cancelModal");
+
+            const closeModal = () => { modal.style.display = "none"; };
+
+            closeX.onclick = closeModal;
+            closeBtn.onclick = closeModal;
+            window.onclick = (event) => {
+                if (event.target == modal) closeModal();
+            };
+
+            // CALL THIS at the end of your DOMContentLoaded block
+            showInitialGreeting();
+        });
+    </script>
 </body>
 </html>

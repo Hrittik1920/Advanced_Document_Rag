@@ -11,12 +11,17 @@ import time
 import functools
 import inspect
 import logging
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 from script import format_documents, original_chain, condense_chain
 
 from datetime import datetime
 
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
+
+# --- Global Task Tracker ---
+active_tasks: Dict[str, asyncio.Task] = {}
 
 def get_today_log_file():
     today = datetime.now().strftime("%d%m%Y")
@@ -42,7 +47,6 @@ def timed(func):
     if inspect.iscoroutinefunction(func):
         return async_wrapper
     return sync_wrapper
-
 
 
 def log_timing(message: str):
@@ -140,97 +144,79 @@ async def disconnect(sid):
     # Clean up from the in-memory cache on disconnect.
     if sid in store:
         del store[sid]
-        
+
 @sio.on("chat_request")
 @timed
 async def handle_chat_request(sid, data: dict):
-    user_query = data.get("message")
-    total_start = time.perf_counter()
     log_timing("\n================ NEW REQUEST ================")
     log_timing(f"Session: {sid}")
-    log_timing(f"Question: {user_query}")
-    if not user_query:
+    
+    if not data.get("message"):
         await sio.emit("error", {"message": "No message content found."}, to=sid)
         return
 
-    print(f"Received query from {sid}: {user_query}")
+    # Create the task and store it
+    task = asyncio.create_task(run_llm_logic(sid, data))
+    active_tasks[sid] = task
     
-    # 0. Get history and condense the question for better retrieval
+    try:
+        await task
+    except asyncio.CancelledError:
+        log_timing(f"Task for {sid} was STOPPED by user.")
+        # When cancelled, the logic in run_llm_logic stops immediately
+    finally:
+        # Always clean up the task from memory
+        active_tasks.pop(sid, None)
+        
+async def run_llm_logic(sid, data: dict):
+    """Actual RAG and LLM logic extracted from the main handler."""
+    user_query = data.get("message")
+    
+    # 0. Get history and condense the question
     history_obj = get_session_history(sid)
     chat_history = history_obj.messages
 
-    start = time.perf_counter()
     if chat_history:
         standalone_question = await condense_chain.ainvoke({
             "question": user_query,
             settings.HISTORY_DIR: chat_history,
         })
-        log_timing(f"Condensed question: '{standalone_question}'")
     else:
         standalone_question = user_query
-    log_timing(f"Condense step took {(time.perf_counter() - start) * 1000:.2f} ms")
 
-    # 1. Use the CONDENSED question for retrieval
-    start = time.perf_counter()
+    # 1. Retrieval
     retrieved_docs = await retriever.ainvoke(standalone_question)
-    log_timing(f"Retriever took {(time.perf_counter() - start) * 1000:.2f} ms")
-
-    start = time.perf_counter()
     context = format_documents(retrieved_docs)
-    log_timing(f"Context formatting took {(time.perf_counter() - start) * 1000:.2f} ms")
-    
-    # Ensure context is never None/empty - use a default if needed
     if not context:
         context = "No relevant documents found in the knowledge base."
 
-    print(f"Invoking RAG chain for session {sid} with streaming...")
-    
-    # 2. Get the full response using ainvoke (compatible with RunnableWithMessageHistory)
+    # 2. Streaming Response
     full_response = ""
     try:
-        start = time.perf_counter()
-        history_obj = get_session_history(sid)
-
-        log_timing("----- SESSION HISTORY -----")
-        for msg in history_obj.messages:
-            log_timing(f"{msg.type.upper()}: {msg.content}")
-        log_timing("----- END SESSION HISTORY -----")
-        
-        # Use .astream() instead of .ainvoke()
         async for chunk in chain_with_history.astream(
             {"context": context, "question": user_query},
             config={"configurable": {"session_id": sid}}
         ):
-            # Depending on your chain setup, the chunk might be a string or an AIMessageChunk
             chunk_text = chunk if isinstance(chunk, str) else chunk.content
             full_response += chunk_text
             
             if chunk_text:
-                await sio.emit(
-                    "chat_stream_chunk", 
-                    {"chunk": chunk_text}, 
-                    to=sid
-                )
-                # Notice: No asyncio.sleep() needed! The speed is naturally dictated by the LLM's inference speed.
+                await sio.emit("chat_stream_chunk", {"chunk": chunk_text}, to=sid)
 
-        log_timing(f"LLM streaming & inference took {(time.perf_counter() - start) * 1000:.2f} ms")
-        log_timing("Answer:")
-        log_timing(full_response)
-        
-        # Emit end-of-stream signal
-        await sio.emit(
-            "chat_stream_end", 
-            {"message": "Stream complete"},
-            to=sid
-        )
+        # Signal completion
+        await sio.emit("chat_stream_end", {"message": "Stream complete"}, to=sid)
         
     except Exception as e:
         print(f"Error during streaming: {e}")
-        await sio.emit(
-            "error", 
-            {"message": f"Stream error: {str(e)}"}, 
-            to=sid
-        )
+        await sio.emit("error", {"message": f"Stream error: {str(e)}"}, to=sid)
+
+@sio.on("stop_generation")
+async def handle_stop_generation(sid):
+    if sid in active_tasks:
+        active_tasks[sid].cancel()
+        # Add this line to tell the frontend we stopped manually
+        await sio.emit("chat_stopped_manually", to=sid)
+        print(f"Manual stop triggered for session: {sid}")
 
 # --- Standard FastAPI Endpoints ---
 @app.get("/")
@@ -248,6 +234,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:socket_app",
         host="0.0.0.0",
-        port=8000,
+        port=8099,
         reload=False,  # Set to True if you want auto-reload during development
     )
