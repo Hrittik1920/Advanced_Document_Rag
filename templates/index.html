@@ -188,14 +188,14 @@
             transform: scale(0.9);
         }
 
-        /* Tooltip with Teal matching UI */
+        /* Update the Tooltip Logic for Multiple Buttons */
         .copy-btn::after {
-            content: "Copy";
+            content: "Copy"; /* Default */
             position: absolute;
             top: -30px;
             left: 50%;
             transform: translateX(-50%) scale(0.8);
-            background: #009688; /* Match your UI teal */
+            background: #009688;
             color: white;
             padding: 4px 8px;
             border-radius: 4px;
@@ -206,9 +206,26 @@
             white-space: nowrap;
         }
 
+        /* Specific tooltip for PDF button */
+        .pdf-export-btn::after {
+            content: "Export as PDF";
+        }
+
         .copy-btn:hover::after {
             opacity: 1;
             transform: translateX(-50%) scale(1);
+        }
+
+        /* Ensure icons inside buttons behave the same */
+        .bot-control-btn svg {
+            width: 18px;
+            height: 18px;
+            fill: #747775;
+            transition: fill 0.2s;
+        }
+
+        .copy-btn:hover svg {
+            fill: #009688;
         }
 
         .copy-icon-svg {
@@ -652,7 +669,7 @@
             let isRequestInProgress = false;
 
             // --- Real Socket Connection Logic ---
-            const socket = io("http://178.63.15.33:8000");
+            const socket = io(window.location.origin);
 
             socket.on("connect", () => {
                 console.log("Connected to server:", socket.id);
@@ -788,64 +805,48 @@
                 // 2. Horizontal Button Row
                 const controls = document.createElement("div");
                 controls.className = "bot-controls";
-                controls.style.display = "none"; // <-- ADD THIS LINE TO HIDE INITIALLY
+                controls.style.display = "none"; 
 
-                // Create Icons
-                const docIcon = `<svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>`;
+                // Icons
                 const pdfIcon = `<svg viewBox="0 0 24 24"><path d="M20 2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8.5 7.5c0 .83-.67 1.5-1.5 1.5H9v2H7.5V7H10c.83 0 1.5.67 1.5 1.5v1zm5 2c0 .83-.67 1.5-1.5 1.5h-2.5V7H15c.83 0 1.5.67 1.5 1.5v3zm4-3H19v1h1.5V11H19v2h-1.5V7h3v1.5zM9 9.5h1v-1H9v1zM14 11h1v-2.5h-1V11zM4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6z"/></svg>`;
 
-                // Copy Button (Matching User Style & Functionality)
+                // Copy Button
                 const copyBtn = document.createElement("button");
-                copyBtn.className = "bot-control-btn copy-btn copy-btn-bot"; // Added 'copy-btn' for hover effects
+                copyBtn.className = "bot-control-btn copy-btn"; 
                 copyBtn.setAttribute("aria-label", "Copy message");
                 copyBtn.innerHTML = `
-                    <svg class="copy-icon-svg" viewBox="0 0 24 24">
+                    <svg viewBox="0 0 24 24">
                         <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
                     </svg>`;
                 
-                // Essential fix: assign the click handler here
                 copyBtn.onclick = () => {
                     const textToCopy = textDiv.innerText || textDiv.textContent;
                     copyToClipboard(textToCopy, copyBtn);
                 };
 
-                // Save Doc
-                const docBtn = document.createElement("button");
-                docBtn.className = "bot-control-btn";
-                docBtn.innerHTML = docIcon;
-                docBtn.onclick = () => {
-                    const blob = new Blob([textDiv.innerText], { type: 'text/plain' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `chat_doc_${Date.now()}.txt`;
-                    a.click();
-                };
-
-                // Save PDF
-                // Updated PDF Button: Opens Pop-up Preview
+                // Export PDF Button (Styled exactly like Copy)
                 const pdfBtn = document.createElement("button");
-                pdfBtn.className = "bot-control-btn";
+                pdfBtn.className = "bot-control-btn copy-btn pdf-export-btn"; 
+                pdfBtn.setAttribute("aria-label", "Export as PDF");
                 pdfBtn.innerHTML = pdfIcon;
+                
                 pdfBtn.onclick = () => {
                     const modal = document.getElementById("pdfModal");
                     const previewBody = document.getElementById("pdfPreviewBody");
                     const downloadBtn = document.getElementById("downloadPdfBtn");
 
-                    // Set the content in the preview
                     previewBody.innerHTML = textDiv.innerHTML;
                     modal.style.display = "flex";
 
-                    // Download Logic inside the popup
                     downloadBtn.onclick = () => {
                         const printWindow = window.open('', '_blank');
-                        printWindow.document.write(`<html><head><title>Download</title><style>body{font-family:Inter,sans-serif;padding:20px;}</style></head><body>${textDiv.innerHTML}</body></html>`);
+                        printWindow.document.write(`<html><head><title>Export</title><style>body{font-family:Inter,sans-serif;padding:40px;line-height:1.6;color:#333;}</style></head><body>${textDiv.innerHTML}</body></html>`);
                         printWindow.document.close();
                         printWindow.print();
                     };
                 };
 
-                controls.append(copyBtn, docBtn, pdfBtn);
+                controls.append(copyBtn, pdfBtn);
                 containerWrapper.append(msgDiv, controls);
 
                 return containerWrapper;
