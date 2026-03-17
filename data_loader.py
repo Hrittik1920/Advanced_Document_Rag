@@ -36,7 +36,6 @@ class MultiFormatDocumentLoader:
             length_function=len,
         )
 
-    # --- Helper Method (ADDED) ---
     def _create_documents_from_text(self, text: str, metadata: dict) -> list[Document]:
         """Helper to split extracted text into Document objects."""
         if not text or not text.strip():
@@ -119,25 +118,31 @@ class MultiFormatDocumentLoader:
         OPTIMIZED: Extracts text from all pages of a PDF, combines it,
         and then splits the combined text into chunks.
         """
-        full_text = ""
+        all_docs = []
         is_scanned = True
+        total_chars = 0
         
         try:
             with open(file_path, "rb") as f:
                 pdf_reader = PyPDF2.PdfReader(f)
-                temp_text = ""
-                for page in pdf_reader.pages:
-                    temp_text += page.extract_text() or ""
-                
-                if len(temp_text.strip()) > 50:
-                    full_text = temp_text
+                for i, page in enumerate(pdf_reader.pages):
+                    page_text = page.extract_text() or ""
+                    if page_text.strip():
+                        total_chars += len(page_text.strip())
+                        metadata = {
+                            "source": os.path.basename(file_path), 
+                            "file_type": "pdf",
+                            "page": i 
+                        }
+                        page_docs = self._create_documents_from_text(page_text, metadata)
+                        all_docs.extend(page_docs)
+                if total_chars> 50:
                     is_scanned = False
 
             # 2. Fallback to OCR if scanned
             if is_scanned:
                 print(f"⚠️ PDF appears scanned: {os.path.basename(file_path)}. Converting to images...")
                 images = convert_from_path(file_path)
-                ocr_pages = []
                 
                 for i, img in enumerate(images):
                     # Save temporary page image
@@ -145,19 +150,24 @@ class MultiFormatDocumentLoader:
                     img.save(temp_page_path, "PNG")
                     
                     page_text = self._run_async_ocr(temp_page_path, f"Page {i+1}")
-                    ocr_pages.append(page_text)
                     
                     if os.path.exists(temp_page_path):
                         os.remove(temp_page_path)
-                
-                full_text = "\n\n".join(ocr_pages)
+                        
+                    
+                    metadata = {
+                        "source": os.path.basename(file_path), 
+                        "file_type": "pdf_scanned",
+                        "page": i 
+                    }
+                    page_docs = self._create_documents_from_text(page_text, metadata)
+                    all_docs.extend(page_docs)
 
         except Exception as e:
             print(f"Error loading PDF {file_path}: {e}")
             return []
         
-        metadata = {"source": os.path.basename(file_path), "file_type": "pdf"}
-        return self._create_documents_from_text(full_text, metadata)
+        return all_docs
 
     def load_docx(self, file_path: str) -> list[Document]:
         """
