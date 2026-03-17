@@ -36,7 +36,7 @@ prompt = ChatPromptTemplate.from_messages([
         "system",
         "You are an AI assistant. Your task is to answer user questions based *only* on the provided context.\n"
         "Structure your entire response using the following Markdown format:\n\n"
-        "### Assistant Response\n"
+        "### Suraksha's Reply\n"
         "[Your concise, conversational answer to the user's question goes here.]\n\n"
         "---\n\n" # Use a horizontal rule as a separator
         "### Key Takeaways\n"
@@ -54,21 +54,48 @@ prompt = ChatPromptTemplate.from_messages([
 def format_documents(docs: list) -> str:
     """
     Turn Document objects into a single string, truncate if too long.
+    and to provide all the citation list for the frontend
     """
     formatted = []
+    citation = []
     total_chars = 0
     for idx, doc in enumerate(docs, start=1):
-        source_info = f"Source: {os.path.basename(doc.metadata.get('source', 'N/A'))}"
+        raw_source = doc.metadata.get('source', '')
+        file_name = os.path.basename(raw_source) if raw_source else 'N/A'
+        source_info = f"Source: {file_name}"
+        
+        location_parts = [source_info]
+        # Default page to 0 if not found, since your endpoint expects an integer
+        page_num = doc.metadata.get('page', 0) 
         if 'page' in doc.metadata:
-            source_info += f", Page {doc.metadata['page']}"
+            location_parts.append(f"Page {page_num}")
         if 'row' in doc.metadata:
-            source_info += f", Row {doc.metadata['row']}"
-        entry = f"[{idx}] {doc.page_content} ({source_info})"
+            location_parts.append(f"Row {doc.metadata['row']}")
+            
+        location_str = ", ".join(location_parts)
+        snippet = doc.page_content.strip()
+        topic = (snippet[:120] + "…") if len(snippet) > 120 else snippet
+        first_sentence_end = snippet.find(". ")
+        if 0 < first_sentence_end < 100:
+            topic = snippet[: first_sentence_end + 1]
+
+        entry = f"[{idx}] {doc.page_content} ({location_str})"
         if total_chars + len(entry) > MAX_CONTEXT_CHARS:
             break
         formatted.append(entry)
         total_chars += len(entry)
-    return "\n\n".join(formatted)
+
+        citation.append({
+            "id": idx,
+            "display_name": file_name,
+            "file_path": raw_source, 
+            "page": page_num,
+            "row": doc.metadata.get("row"),
+            "topic": topic,
+        })
+        formatted.append(entry)
+        total_chars += len(entry)
+    return "\n\n".join(formatted), citation
 
 # --- Core RAG Chain (Stateless) ---
 # This is the 'original_chain' that server.py will import.

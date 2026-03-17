@@ -1,9 +1,9 @@
 import os
 import json
 import asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import FileResponse 
+from starlette.responses import FileResponse, StreamingResponse
 from typing import List, Dict
 import socketio
 import uvicorn
@@ -13,6 +13,7 @@ import inspect
 import logging
 import warnings
 import sys
+import io
 warnings.filterwarnings("ignore", category=FutureWarning)
 from script import format_documents, original_chain, condense_chain
 
@@ -60,6 +61,8 @@ def log_timing(message: str):
 logger = logging.getLogger("timing_logger")
 # --- Your Existing RAG and LangChain Imports ---
 from vector import retriever
+import fitz
+
 # New, correct line
 from script import format_documents, original_chain
 from langchain_core.chat_history import BaseChatMessageHistory
@@ -201,9 +204,10 @@ async def run_llm_logic(sid, data: dict):
 
     # 1. Retrieval
     retrieved_docs = await retriever.ainvoke(standalone_question)
-    context = format_documents(retrieved_docs)
+    context, citation = format_documents(retrieved_docs)
     if not context:
         context = "No relevant documents found in the knowledge base."
+        citation=[]
 
     # 2. Streaming Response
     full_response = ""
@@ -219,7 +223,7 @@ async def run_llm_logic(sid, data: dict):
                 await sio.emit("chat_stream_chunk", {"chunk": chunk_text}, to=sid)
 
         # Signal completion
-        await sio.emit("chat_stream_end", {"message": "Stream complete"}, to=sid)
+        await sio.emit("chat_stream_end", {"message": "Stream complete", "citation" : citation}, to=sid)
         
     except Exception as e:
         print(f"Error during streaming: {e}")
@@ -244,6 +248,71 @@ def get_history(session_id: str):
     """A utility endpoint to inspect the history file of a given session."""
     history = FileChatMessageHistory(session_id=session_id)
     return history.messages
+
+@app.get("/v1/document-page")
+async def get_document_page(source: str, page: int = 0):
+    """
+    Renders a single page of a document as a PNG image.
+    - source: full or relative path to the file (from doc metadata)
+    - page:   0-indexed page number
+    """
+    # Resolve path safely — only allow files inside DOCUMENTS_DIR
+    if not os.path.isabs(source) and not source.startswith(settings.DOCUMENTS_DIR):
+        safe_filename = os.path.basename(source)
+        target_path = os.path.join(settings.DOCUMENTS_DIR, safe_filename)
+    else:
+        target_path = source
+    abs_source = os.path.realpath(target_path)
+    abs_allowed = os.path.realpath(settings.DOCUMENTS_DIR)
+    if not abs_source.startswith(abs_allowed):
+        print(f"DEBUG: Blocked access. {abs_source} is not inside {abs_allowed}")
+        raise HTTPException(status_code=403, detail="Access denied.")
+    if not os.path.exists(abs_source):
+        print(f"DEBUG: File not found at {abs_source}")
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    ext = os.path.splitext(abs_source)[1].lower()
+
+    # ── PDF ──────────────────────────────────────
+    if ext == ".pdf":
+        doc = fitz.open(abs_source)
+        if page < 0 or page >= len(doc):
+            raise HTTPException(status_code=400, detail=f"Page {page} out of range (0–{len(doc)-1}).")
+        pdf_page = doc[page]
+        mat = fitz.Matrix(2.0, 2.0)   # 2× zoom for readability
+        pix = pdf_page.get_pixmap(matrix=mat, alpha=False)
+        img_bytes = pix.tobytes("png")
+
+    # ── Word / DOCX — convert the whole doc to PDF first ─
+    elif ext in (".docx", ".doc"):
+        try:
+            import subprocess, tempfile
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp_pdf = tmp.name
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pdf",
+                 "--outdir", os.path.dirname(tmp_pdf), abs_source],
+                check=True, capture_output=True
+            )
+            converted = os.path.splitext(abs_source)[0] + ".pdf"
+            doc = fitz.open(converted)
+            pdf_page = doc[min(page, len(doc) - 1)]
+            mat = fitz.Matrix(2.0, 2.0)
+            pix = pdf_page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes("png")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")
+
+    # ── Standalone image file ─────────────────────
+    elif ext in (".png", ".jpg", ".jpeg", ".webp"):
+        with open(abs_source, "rb") as f:
+            img_bytes = f.read()
+
+    else:
+        raise HTTPException(status_code=415, detail=f"Unsupported file type: {ext}")
+
+    return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+
 
 if __name__ == "__main__":
     port=8000
