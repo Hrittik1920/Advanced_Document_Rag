@@ -35,15 +35,16 @@ prompt = ChatPromptTemplate.from_messages([
     (
         "system",
         "You are an AI assistant. Your task is to answer user questions based *only* on the provided context.\n"
+        "CRITICAL INSTRUCTION: When you use information from the context to form your answer, you MUST cite the exact source index inline using brackets (e.g., [1], [3]).\n\n"
         "Structure your entire response using the following Markdown format:\n\n"
         "### Suraksha's Reply\n"
-        "[Your concise, conversational answer to the user's question goes here.]\n\n"
-        "---\n\n" # Use a horizontal rule as a separator
+         "[Your concise, conversational answer to the user's question goes here. Include inline citations like [1] where applicable.]\n\n"
+         "---\n\n"
         "### Key Takeaways\n"
-        "[A bulleted list of the most important points and sources from the context goes here.]\n\n"
+        "[A bulleted list of the most important points from the context goes here. Include citations here too.]\n\n"
         "**Important Rules**:\n"
         "- If the context does not contain the answer, your entire response should only be 'I could not find relevant information in the documents for that question.'\n"
-        "- For simple greetings, provide only the 'Assistant Response' part without the 'Key Takeaways' or the separator.\n"
+        "- For simple greetings, provide only the 'Suraksha's Reply' part without the 'Key Takeaways' or the separator.\n"
         "CONTEXT:\n---\n{context}\n---"
     ),
     MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
@@ -93,8 +94,6 @@ def format_documents(docs: list) -> str:
             "row": doc.metadata.get("row"),
             "topic": topic,
         })
-        formatted.append(entry)
-        total_chars += len(entry)
     return "\n\n".join(formatted), citation
 
 # --- Core RAG Chain (Stateless) ---

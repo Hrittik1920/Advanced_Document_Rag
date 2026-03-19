@@ -7,10 +7,13 @@ from starlette.responses import FileResponse, StreamingResponse
 from typing import List, Dict
 import socketio
 import uvicorn
+import re
 import time
 import functools
 import inspect
 import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
 import warnings
 import sys
 import io
@@ -57,14 +60,14 @@ def log_timing(message: str):
     
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {message}\n")
+def log_debug(message: str):
+    log_timing(f"[DEBUG] {message}")
 
 logger = logging.getLogger("timing_logger")
 # --- Your Existing RAG and LangChain Imports ---
 from vector import retriever
 import fitz
 
-# New, correct line
-from script import format_documents, original_chain
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
@@ -189,6 +192,7 @@ async def handle_chat_request(sid, data: dict):
 async def run_llm_logic(sid, data: dict):
     """Actual RAG and LLM logic extracted from the main handler."""
     user_query = data.get("message")
+    log_debug(f"Received query: {user_query}")
     
     # 0. Get history and condense the question
     history_obj = get_session_history(sid)
@@ -201,16 +205,29 @@ async def run_llm_logic(sid, data: dict):
         })
     else:
         standalone_question = user_query
-
+    log_debug(f"Standalone question: {standalone_question}")
     # 1. Retrieval
     retrieved_docs = await retriever.ainvoke(standalone_question)
+    log_debug(f"Retrieved Docs Count: {len(retrieved_docs)}")
     context, citation = format_documents(retrieved_docs)
     if not context:
         context = "No relevant documents found in the knowledge base."
         citation=[]
-
+    preview_context = context[:500] + "..." if len(context) > 500 else context
+    log_debug(f"Context Preview: {preview_context}")
+    log_debug(f"Context Length: {len(context)} chars")
     # 2. Streaming Response
     full_response = ""
+    final_prompt_preview = f"""
+        --- FINAL PROMPT ---
+        Context:
+        {context[:800]}
+
+        Question:
+        {user_query}
+        ---------------------
+        """
+    log_debug(final_prompt_preview)
     try:
         async for chunk in chain_with_history.astream(
             {"context": context, "question": user_query},
@@ -223,10 +240,15 @@ async def run_llm_logic(sid, data: dict):
                 await sio.emit("chat_stream_chunk", {"chunk": chunk_text}, to=sid)
 
         # Signal completion
-        await sio.emit("chat_stream_end", {"message": "Stream complete", "citation" : citation}, to=sid)
+        used_ids_matches = re.findall(r'[\[【](\d+)[\]】]', full_response)
+        used_ids = {int(idx) for idx in used_ids_matches}
+        final_citations = [c for c in citation if c["id"] in used_ids]
+        await sio.emit("chat_stream_end", {"message": "Stream complete", "citation" : final_citations}, to=sid)
+        log_debug(f"Final Response Preview: {full_response[:500]}")
+        log_debug(f"Response Length: {len(full_response)} chars")
         
     except Exception as e:
-        print(f"Error during streaming: {e}")
+        log_debug(f"Error during streaming: {e}")
         await sio.emit("error", {"message": f"Stream error: {str(e)}"}, to=sid)
 
 @sio.on("stop_generation")
@@ -315,10 +337,10 @@ async def get_document_page(source: str, page: int = 0):
 
 
 if __name__ == "__main__":
-    port=8000
+    port=8010
     reload_flag=False
     if "dev" in sys.argv:
-        port=8099
+        port=8100
         reload_flag=True
     uvicorn.run(
         "server:socket_app",

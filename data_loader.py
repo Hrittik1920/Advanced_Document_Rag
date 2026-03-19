@@ -46,7 +46,6 @@ class MultiFormatDocumentLoader:
     # --- New Internal OCR Logic (Hybrid Tesseract + VLM) ---
 
     async def _get_ocr_text_async(self, file_path, origin_info="Image"):
-        """Internal async method to handle the OCR logic flow."""
         ocr_text = ""
         confidence = 0
         
@@ -69,12 +68,22 @@ class MultiFormatDocumentLoader:
         if self._should_use_vlm_fallback(ocr_text, confidence):
             print(f"🔄 Low quality result for {origin_info}. Falling back to VLM...")
             try:
-                ocr_text = await query_ollama(
-                    prompt="Extract all readable text from this image. Return only text.",
+                # FIX: Handle the async generator correctly
+                response_gen = await query_ollama(
+                    prompt="Extract all readable text from this image. Return only the text content.",
                     model="deepseek-ocr:latest",
                     image_path=file_path,
                     keep_alive=0
                 )
+                
+                vlm_text_parts = []
+                async for chunk in response_gen:
+                    # Adjust 'content' key based on your specific llm_clients implementation
+                    part = chunk.get("message", {}).get("content", "")
+                    vlm_text_parts.append(part)
+                
+                ocr_text = "".join(vlm_text_parts).strip()
+                
             except Exception as e:
                 print(f"❌ VLM Fallback failed: {e}")
         
@@ -114,59 +123,53 @@ class MultiFormatDocumentLoader:
         return self._create_documents_from_text(full_text, metadata)
 
     def load_pdf(self, file_path: str) -> list[Document]:
-        """
-        OPTIMIZED: Extracts text from all pages of a PDF, combines it,
-        and then splits the combined text into chunks.
-        """
+    # 1. Check if file is empty first
+        if os.path.getsize(file_path) == 0:
+            print(f"Skipping empty file: {file_path}")
+            return []
+
         all_docs = []
         is_scanned = True
-        total_chars = 0
+        combined_text = ""
         
         try:
             with open(file_path, "rb") as f:
                 pdf_reader = PyPDF2.PdfReader(f)
                 for i, page in enumerate(pdf_reader.pages):
                     page_text = page.extract_text() or ""
-                    if page_text.strip():
-                        total_chars += len(page_text.strip())
-                        metadata = {
-                            "source": os.path.basename(file_path), 
-                            "file_type": "pdf",
-                            "page": i 
-                        }
-                        page_docs = self._create_documents_from_text(page_text, metadata)
-                        all_docs.extend(page_docs)
-                if total_chars> 50:
-                    is_scanned = False
+                    combined_text += page_text
 
-            # 2. Fallback to OCR if scanned
+            # 2. Stronger heuristic: If less than 200 chars in whole doc, it's likely scanned
+            if len(combined_text.strip()) > 200:
+                is_scanned = False
+                metadata = {"source": os.path.basename(file_path), "file_type": "pdf"}
+                all_docs = self._create_documents_from_text(combined_text, metadata)
+
+            # 3. Fallback to OCR
             if is_scanned:
-                print(f"⚠️ PDF appears scanned: {os.path.basename(file_path)}. Converting to images...")
+                print(f"⚠️ PDF appears scanned: {os.path.basename(file_path)}.")
                 images = convert_from_path(file_path)
                 
                 for i, img in enumerate(images):
-                    # Save temporary page image
-                    temp_page_path = f"temp_page_{i}.png"
+                    # Use a unique temp name to avoid race conditions
+                    temp_page_path = f"temp_{os.getpid()}_{i}.png"
                     img.save(temp_page_path, "PNG")
                     
                     page_text = self._run_async_ocr(temp_page_path, f"Page {i+1}")
                     
                     if os.path.exists(temp_page_path):
                         os.remove(temp_page_path)
-                        
                     
                     metadata = {
                         "source": os.path.basename(file_path), 
                         "file_type": "pdf_scanned",
-                        "page": i 
+                        "page": i + 1 
                     }
-                    page_docs = self._create_documents_from_text(page_text, metadata)
-                    all_docs.extend(page_docs)
+                    all_docs.extend(self._create_documents_from_text(page_text, metadata))
 
         except Exception as e:
             print(f"Error loading PDF {file_path}: {e}")
-            return []
-        
+            
         return all_docs
 
     def load_docx(self, file_path: str) -> list[Document]:

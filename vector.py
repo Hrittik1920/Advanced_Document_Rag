@@ -267,23 +267,35 @@ def initialize_retriever() -> HybridRetriever:
     if docs_to_add:
         print(f"\nIndexing {len(docs_to_add)} new chunks...")
 
+        # 1. Filter out duplicates WITHIN the new docs_to_add list itself
+        unique_docs_to_add = {}
+        for d in docs_to_add:
+            did = doc_id(d)
+            if did not in unique_docs_to_add:
+                unique_docs_to_add[did] = d
+        
+        # 2. Convert back to list and prepare for batching
+        final_docs = list(unique_docs_to_add.values())
+        final_ids = list(unique_docs_to_add.keys())
+
         # Dense: batch-embed into Chroma
         batch_size = 100
-        for i in tqdm(range(0, len(docs_to_add), batch_size), desc="Embedding (dense)"):
-            batch = docs_to_add[i : i + batch_size]
-            ids   = [doc_id(d) for d in batch]
-            vector_store.add_documents(documents=batch, ids=ids)
+        for i in tqdm(range(0, len(final_docs), batch_size), desc="Embedding (dense)"):
+            batch = final_docs[i : i + batch_size]
+            batch_ids = final_ids[i : i + batch_size]
+            
+            # Use upsert instead of add_documents to be safer
+            vector_store.add_documents(documents=batch, ids=batch_ids)
 
-        # Sparse: add new chunks to BM25 corpus
-        added = 0
-        for d in tqdm(docs_to_add, desc="Indexing  (BM25)"):
-            did = doc_id(d)
+        # Sparse: add new chunks to BM25 corpus (using the same unique list)
+        added_count = 0
+        for did, d in unique_docs_to_add.items():
             if did not in existing_ids:
                 corpus.append({"content": d.page_content, "metadata": d.metadata})
                 existing_ids.add(did)
-                added += 1
+                added_count += 1
 
-        print(f"  {added} unique chunks added to BM25 corpus.")
+        print(f"  {added_count} unique chunks added to BM25 corpus.")
         save_bm25_index({"corpus": corpus, "ids": existing_ids})
         save_file_hashes(updated_hashes)
         print("Indexes saved to disk.")

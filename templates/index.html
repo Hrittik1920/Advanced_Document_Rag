@@ -220,13 +220,19 @@
             });
 
             socket.on("chat_stream_end", (data) => {
-                if (currentBotMessageElement) {
-                    if (data && data.citation && data.citation.length > 0) {
-                        renderCitations(data.citation, currentBotMessageElement);
-                    }
-                    const controls = currentBotMessageElement.querySelector(".bot-controls");
-                    if (controls) controls.style.display = "flex";
+                // If a citation is provided at the end, render it first
+                if (currentBotMessageElement && data && data.citation) {
+                    renderCitations(data.citation, currentBotMessageElement);
                 }
+
+                // Identify the wrapper and show the controls only now
+                if (currentBotMessageElement) {
+                    const controls = currentBotMessageElement.querySelector(".bot-controls");
+                    if (controls) {
+                        controls.style.display = "flex";
+                    }
+                }
+
                 currentBotMessageElement = null;
                 resetInputState();
             });
@@ -265,7 +271,20 @@
             };
 
             chatForm.addEventListener("submit", handleSendMessage);
-            userInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatForm.dispatchEvent(new Event('submit')); } });
+            userInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    if (e.shiftKey) {
+                        // Allow default behavior (new line)
+                        return;
+                    } else {
+                        // Prevent default (new line) and send message
+                        e.preventDefault();
+                        if (!isRequestInProgress) {
+                            chatForm.dispatchEvent(new Event('submit'));
+                        }
+                    }
+                }
+            });
             userInput.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = (this.scrollHeight) + 'px'; this.style.overflowY = this.scrollHeight > 150 ? 'auto' : 'hidden'; });
 
             function toggleButtonState(processing) {
@@ -341,8 +360,13 @@
                     wrapper.append(copyBtn, div); chatBox.appendChild(wrapper);
                 } else {
                     const botElementWrapper = createBotMessageElement(); 
-                    const controls = botElementWrapper.querySelector(".bot-controls"); if (controls) controls.style.display = "flex";
-                    appendChunkToBotMessage(botElementWrapper, content); chatBox.appendChild(botElementWrapper);
+                    appendChunkToBotMessage(botElementWrapper, content);
+                    
+                    // Show controls only after appending the content
+                    const controls = botElementWrapper.querySelector(".bot-controls");
+                    if (controls) controls.style.display = "flex";
+                    
+                    chatBox.appendChild(botElementWrapper);
                 }
                 scrollToBottom();
             }
@@ -434,9 +458,17 @@
             function scrollToBottom() { chatBox.scrollTo({ top: chatBox.scrollHeight, behavior: 'smooth' }); }
 
             function showInitialGreeting() {
-                const params = new URLSearchParams(window.location.search); const userName = params.get('username');
-                let greetingHTML = userName ? `Hello <span class="user-name-highlight">${userName.toLowerCase().replace(/\b\w/g, c => c.toUpperCase())}</span>! How can I help you today?` : `Hello! How can I help you today?`;
-                const element = createBotMessageElement(); element.querySelector(".formatted-response").innerHTML = greetingHTML; element.querySelector(".bot-controls").style.display = "flex"; chatBox.appendChild(element); scrollToBottom();
+                const params = new URLSearchParams(window.location.search); 
+                const userName = params.get('username');
+                
+                let greetingHTML = userName 
+                    ? `Hello <span class="user-name-highlight">${userName.toLowerCase().replace(/\b\w/g, c => c.toUpperCase())}</span>! How can I help you today?` 
+                    : `Hello! How can I help you today?`;
+                
+                const element = createBotMessageElement(); 
+                element.querySelector(".formatted-response").innerHTML = greetingHTML; 
+                chatBox.appendChild(element); 
+                scrollToBottom();
             }
             
             showInitialGreeting();
@@ -453,4 +485,3 @@
         });
     </script>
 </body>
-</html>
