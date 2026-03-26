@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import asyncio
 import nest_asyncio
 import cv2
@@ -12,256 +13,530 @@ from pathlib import Path
 from PIL import Image
 from pdf2image import convert_from_path
 from docx import Document as DocxDocument
+from docx.oxml.ns import qn
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import hashlib
+import uuid
 
-# Import your VLM client and settings
 from llm_clients import query_ollama
 
 nest_asyncio.apply()
-class MultiFormatDocumentLoader:
+
+# ---------------------------------------------------------------------------
+# Heading / topic-aware splitter
+# ---------------------------------------------------------------------------
+
+class HeaderAwareTextSplitter:
     """
-    Load and process various document formats with significant optimizations
-    for creating fewer, more meaningful document chunks.
+    Splits text into chunks that respect section boundaries (headers/topics).
+
+    Strategy:
+      1. Try to detect headers via the format-specific extractor supplied by
+         each loader (returns a list of (header, body) tuples).
+      2. If a resulting section body is still very large, apply a lightweight
+         paragraph-level fallback splitter *with minimal overlap only on those
+         sub-splits* — not globally.
+      3. If no headers are found at all, fall back to paragraph splitting.
+
+    Overlap is intentionally removed at the section level.  A small overlap
+    (FALLBACK_OVERLAP) is applied only when a single section must be further
+    subdivided, so that long sections don't lose context at split boundaries.
     """
 
-    def __init__(self, chunk_size=2000, chunk_overlap=200):
+    MAX_SECTION_CHARS = 3000   # Sections larger than this get sub-split
+    FALLBACK_OVERLAP  = 80     # Overlap used *only* inside over-long sections
+
+    def __init__(self):
+        self._fallback_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.MAX_SECTION_CHARS,
+            chunk_overlap=self.FALLBACK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""],
+            length_function=len,
+        )
+    def _generate_chunk_id(self, text: str, meta: dict) -> str:
+        """Generates a deterministic ID based on source and content."""
+        source = meta.get("source", "unknown")
+        # Hash the source and the first 100 chars of content
+        unique_string = f"{source}::{text[:100]}"
+        return hashlib.sha256(unique_string.encode('utf-8')).hexdigest()[:12]
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def split_sections(
+        self,
+        sections: list[tuple[str, str]],   # [(header, body), ...]
+        base_metadata: dict,
+    ) -> list[Document]:
+        """
+        Convert pre-parsed (header, body) pairs into Documents.
+        Applies sub-splitting only when a section body exceeds MAX_SECTION_CHARS.
+        """
+        docs = []
+        for header, body in sections:
+            body = body.strip()
+            if not body:
+                continue
+
+            meta = {**base_metadata, "section": header} if header else base_metadata.copy()
+
+            if len(body) <= self.MAX_SECTION_CHARS:
+                meta["chunk_id"] = self._generate_chunk_id(body, meta)
+                docs.append(Document(page_content=body, metadata=meta))
+            else:
+                # Sub-split oversized sections; keep the header in metadata
+                sub_docs = self._fallback_splitter.create_documents(
+                    [body], metadatas=[meta]
+                )
+                for idx, sub_doc in enumerate(sub_docs):
+                    sub_doc.metadata["chunk_id"] = f"{self._generate_chunk_id(sub_doc.page_content, meta)}_{idx}"
+                docs.extend(sub_docs)
+
+        return docs
+
+    def split_plain_text(self, text: str, base_metadata: dict) -> list[Document]:
+        """
+        Detect headers in raw text, then call split_sections.
+        Falls back to paragraph grouping if no headers are found.
+        """
+        sections = _detect_text_headers(text)
+        if sections:
+            return self.split_sections(sections, base_metadata)
+
+        # No headers — split by paragraphs, merge small ones
+        sections = _paragraph_sections(text)
+        return self.split_sections(sections, base_metadata)
+
+
+# ---------------------------------------------------------------------------
+# Header detection helpers (module-level, no state needed)
+# ---------------------------------------------------------------------------
+
+# Matches: "# Header", "## Sub", "### Sub-sub"
+_MARKDOWN_HEADER_RE = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
+
+# Matches: "1.2.3  Some Title", "CHAPTER 3 — INTRO", all-caps short lines
+_GENERIC_HEADER_RE = re.compile(
+    r"^(?:"
+    r"(?:\d+[\.\d]*\s+[A-Z].{3,60})"      # Numbered: "1.2 Section Title"
+    r"|(?:[A-Z][A-Z\s\-]{4,60}[A-Z])"      # ALL CAPS line
+    r"|(?:(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+.*)"  # Keyword + number
+    r")$",
+    re.MULTILINE,
+)
+
+
+def _detect_text_headers(text: str) -> list[tuple[str, str]]:
+    """
+    Returns [(header_label, section_body), ...] or [] if no headers found.
+    Tries Markdown headers first, then generic pattern headers.
+    """
+    # --- Markdown-style ---
+    matches = list(_MARKDOWN_HEADER_RE.finditer(text))
+    if len(matches) >= 2:
+        return _build_sections_from_matches(text, matches, label_group=2)
+
+    # --- Generic / academic style ---
+    matches = list(_GENERIC_HEADER_RE.finditer(text))
+    if len(matches) >= 2:
+        return _build_sections_from_matches(text, matches, label_group=0)
+
+    return []
+
+
+def _build_sections_from_matches(
+    text: str,
+    matches: list,
+    label_group: int,
+) -> list[tuple[str, str]]:
+    sections = []
+    for idx, match in enumerate(matches):
+        header = match.group(label_group).strip()
+        body_start = match.end()
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[body_start:body_end].strip()
+        sections.append((header, body))
+    return sections
+
+
+def _paragraph_sections(text: str, min_chars: int = 100) -> list[tuple[str, str]]:
+    """
+    Splits text into paragraph blocks, merging tiny paragraphs
+    with the next one to avoid single-sentence micro-chunks.
+    """
+    raw_paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    merged: list[str] = []
+    buffer = ""
+    for para in raw_paras:
+        buffer = (buffer + "\n\n" + para).strip() if buffer else para
+        if len(buffer) >= min_chars:
+            merged.append(buffer)
+            buffer = ""
+    if buffer:
+        if merged:
+            merged[-1] += "\n\n" + buffer   # attach trailing fragment to last chunk
+        else:
+            merged.append(buffer)
+
+    return [("", block) for block in merged]
+
+
+# ---------------------------------------------------------------------------
+# DOCX-specific section extractor
+# ---------------------------------------------------------------------------
+
+def _extract_docx_sections(docx: DocxDocument) -> list[tuple[str, str]]:
+    """
+    Walk paragraphs; whenever we hit a Heading style, start a new section.
+    Returns [(heading_text, section_body), ...].
+    Falls back to returning all text as one unnamed section if no headings exist.
+    """
+    sections: list[tuple[str, str]] = []
+    current_heading = ""
+    current_body_lines: list[str] = []
+
+    for para in docx.paragraphs:
+        style_name = para.style.name if para.style else ""
+        text = para.text.strip()
+        if not text:
+            continue
+
+        if style_name.startswith("Heading"):
+            # Save previous section
+            if current_body_lines:
+                sections.append((current_heading, "\n".join(current_body_lines)))
+            current_heading = text
+            current_body_lines = []
+        else:
+            current_body_lines.append(text)
+
+    # Flush last section
+    if current_body_lines:
+        sections.append((current_heading, "\n".join(current_body_lines)))
+
+    return sections if sections else [("", "\n".join(
+        p.text.strip() for p in docx.paragraphs if p.text.strip()
+    ))]
+
+
+# ---------------------------------------------------------------------------
+# PDF-specific header heuristic (applied after text extraction)
+# ---------------------------------------------------------------------------
+
+def _extract_pdf_sections(text: str) -> list[tuple[str, str]]:
+    """
+    Runs header detection on extracted PDF text.
+    Identical to the generic text path but kept separate for clarity.
+    """
+    return _detect_text_headers(text) or _paragraph_sections(text)
+
+
+# ---------------------------------------------------------------------------
+# Main loader class
+# ---------------------------------------------------------------------------
+
+class MultiFormatDocumentLoader:
+    """
+    Load and process various document formats using header/topic-aware chunking.
+    Chunks align with document structure (sections, headings) rather than
+    arbitrary character counts.
+    """
+
+    def __init__(self):
         self.supported_extensions = {
             ".pdf", ".docx", ".csv", ".xlsx", ".xls", ".txt",
             ".png", ".jpg", ".jpeg", ".bmp", ".tiff"
         }
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""],
-            length_function=len,
-        )
+        self.splitter = HeaderAwareTextSplitter()
 
-    def _create_documents_from_text(self, text: str, metadata: dict) -> list[Document]:
-        """Helper to split extracted text into Document objects."""
-        if not text or not text.strip():
-            return []
-        # Langchain's text splitter can process a list of texts and metadatas
-        return self.text_splitter.create_documents([text], metadatas=[metadata])
+    # ------------------------------------------------------------------
+    # OCR helpers (unchanged from original)
+    # ------------------------------------------------------------------
 
-    # --- New Internal OCR Logic (Hybrid Tesseract + VLM) ---
-
-    async def _get_ocr_text_async(self, file_path, origin_info="Image"):
+    async def _get_ocr_text_async(self, file_path: str, origin_info: str = "Image") -> str:
         ocr_text = ""
         confidence = 0
-        
+
         try:
-            # Tesseract Step
             img = cv2.imread(file_path)
             if img is not None:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                
                 ocr_data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DICT)
                 ocr_text = pytesseract.image_to_string(thresh).strip()
-                
-                confidences = [int(conf) for conf in ocr_data['conf'] if int(conf) != -1]
+                confidences = [int(c) for c in ocr_data["conf"] if int(c) != -1]
                 confidence = sum(confidences) / len(confidences) if confidences else 0
         except Exception as e:
-            print(f"⚠️ Tesseract failed for {origin_info}: {e}")
+            print(f"⚠️  Tesseract failed for {origin_info}: {e}")
 
-        # Quality Check & VLM Fallback
         if self._should_use_vlm_fallback(ocr_text, confidence):
-            print(f"🔄 Low quality result for {origin_info}. Falling back to VLM...")
+            print(f"🔄 Low quality OCR for {origin_info}. Falling back to VLM...")
             try:
-                # FIX: Handle the async generator correctly
                 response_gen = await query_ollama(
                     prompt="Extract all readable text from this image. Return only the text content.",
                     model="deepseek-ocr:latest",
                     image_path=file_path,
-                    keep_alive=0
+                    keep_alive=0,
                 )
-                
-                vlm_text_parts = []
+                parts = []
                 async for chunk in response_gen:
-                    # Adjust 'content' key based on your specific llm_clients implementation
-                    part = chunk.get("message", {}).get("content", "")
-                    vlm_text_parts.append(part)
-                
-                ocr_text = "".join(vlm_text_parts).strip()
-                
+                    parts.append(chunk.get("message", {}).get("content", ""))
+                ocr_text = "".join(parts).strip()
             except Exception as e:
-                print(f"❌ VLM Fallback failed: {e}")
-        
+                print(f"❌ VLM fallback failed: {e}")
+
         return ocr_text
 
-    def _should_use_vlm_fallback(self, text, confidence):
-        """Logic to decide if OCR quality is sufficient."""
+    def _should_use_vlm_fallback(self, text: str, confidence: float) -> bool:
         if not text or len(text) < 10 or confidence < 60:
             return True
-        
         words = text.split()
-        if not words: return True
-        
-        avg_word_length = sum(len(w) for w in words) / len(words)
-        if avg_word_length < 2.5: return True # Fragmented text
-        
-        return False
+        if not words:
+            return True
+        return (sum(len(w) for w in words) / len(words)) < 2.5
 
-    def _run_async_ocr(self, file_path, origin_info):
-        """Helper to run the async OCR logic in a synchronous environment."""
+    def _run_async_ocr(self, file_path: str, origin_info: str) -> str:
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
         return loop.run_until_complete(self._get_ocr_text_async(file_path, origin_info))
 
-    # --- Updated Loaders ---
+    # ------------------------------------------------------------------
+    # Format loaders
+    # ------------------------------------------------------------------
 
     def load_image(self, file_path: str) -> list[Document]:
-        """Extracts text using the Hybrid OCR logic."""
-        print(f"⏳ Processing Image: {os.path.basename(file_path)}")
-        full_text = self._run_async_ocr(file_path, os.path.basename(file_path))
-        
+        """
+        Images produce a single document — OCR output has no reliable
+        heading structure to split on.
+        """
+        print(f"⏳ Processing image: {os.path.basename(file_path)}")
+        text = self._run_async_ocr(file_path, os.path.basename(file_path))
+        if not text:
+            return []
+        # Still attempt header-based splitting in case the image is a scanned doc
         metadata = {"source": os.path.basename(file_path), "file_type": "image"}
-        return self._create_documents_from_text(full_text, metadata)
+        return self.splitter.split_plain_text(text, metadata)
 
     def load_pdf(self, file_path: str) -> list[Document]:
-    # 1. Check if file is empty first
         if os.path.getsize(file_path) == 0:
             print(f"Skipping empty file: {file_path}")
             return []
 
-        all_docs = []
-        is_scanned = True
         combined_text = ""
-        
         try:
             with open(file_path, "rb") as f:
-                pdf_reader = PyPDF2.PdfReader(f)
-                for i, page in enumerate(pdf_reader.pages):
-                    page_text = page.extract_text() or ""
-                    combined_text += page_text
-
-            # 2. Stronger heuristic: If less than 200 chars in whole doc, it's likely scanned
-            if len(combined_text.strip()) > 200:
-                is_scanned = False
-                metadata = {"source": os.path.basename(file_path), "file_type": "pdf"}
-                all_docs = self._create_documents_from_text(combined_text, metadata)
-
-            # 3. Fallback to OCR
-            if is_scanned:
-                print(f"⚠️ PDF appears scanned: {os.path.basename(file_path)}.")
-                images = convert_from_path(file_path)
-                
-                for i, img in enumerate(images):
-                    # Use a unique temp name to avoid race conditions
-                    temp_page_path = f"temp_{os.getpid()}_{i}.png"
-                    img.save(temp_page_path, "PNG")
-                    
-                    page_text = self._run_async_ocr(temp_page_path, f"Page {i+1}")
-                    
-                    if os.path.exists(temp_page_path):
-                        os.remove(temp_page_path)
-                    
-                    metadata = {
-                        "source": os.path.basename(file_path), 
-                        "file_type": "pdf_scanned",
-                        "page": i + 1 
-                    }
-                    all_docs.extend(self._create_documents_from_text(page_text, metadata))
-
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    combined_text += page.extract_text() or ""
         except Exception as e:
-            print(f"Error loading PDF {file_path}: {e}")
-            
+            print(f"Error reading PDF {file_path}: {e}")
+            return []
+
+        metadata = {"source": os.path.basename(file_path), "file_type": "pdf"}
+
+        # Digital PDF with sufficient text
+        if len(combined_text.strip()) > 200:
+            sections = _extract_pdf_sections(combined_text)
+            return self.splitter.split_sections(sections, metadata)
+
+        # Scanned PDF — OCR each page, treat each page as its own section
+        print(f"⚠️  Scanned PDF detected: {os.path.basename(file_path)}")
+        all_docs: list[Document] = []
+        try:
+            images = convert_from_path(file_path)
+            for i, img in enumerate(images):
+                temp_path = f"temp_{os.getpid()}_{i}.png"
+                img.save(temp_path, "PNG")
+                page_text = self._run_async_ocr(temp_path, f"Page {i + 1}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                if not page_text:
+                    continue
+                page_meta = {**metadata, "file_type": "pdf_scanned", "page": i + 1}
+                # Each scanned page is already a natural boundary
+                sections = _detect_text_headers(page_text) or [("", page_text)]
+                all_docs.extend(self.splitter.split_sections(sections, page_meta))
+        except Exception as e:
+            print(f"Error during scanned PDF OCR for {file_path}: {e}")
+
         return all_docs
 
     def load_docx(self, file_path: str) -> list[Document]:
-        """
-        OPTIMIZED: Extracts text from a .docx file, combines it,
-        and then splits the combined text.
-        """
         try:
             docx = DocxDocument(file_path)
-            full_text = "\n".join([p.text for p in docx.paragraphs if p.text.strip()])
         except Exception as e:
             print(f"Error loading DOCX {file_path}: {e}")
             return []
-            
+
+        sections = _extract_docx_sections(docx)
         metadata = {"source": os.path.basename(file_path), "file_type": "docx"}
-        return self._create_documents_from_text(full_text, metadata)
+        return self.splitter.split_sections(sections, metadata)
 
     def load_csv(self, file_path: str, rows_per_chunk: int = 250) -> list[Document]:
         """
-        OPTIMIZED: Loads a large CSV by grouping rows into larger documents
-        for much faster processing.
+        CSVs have no heading structure; row-group chunking is the right
+        semantic boundary here — unchanged from original.
         """
         docs = []
         try:
-            chunk_iter = pd.read_csv(file_path, on_bad_lines='skip', chunksize=rows_per_chunk, low_memory=True)
-            for i, df_chunk in enumerate(chunk_iter):
-                string_buffer = io.StringIO()
-                df_chunk.to_csv(string_buffer, index=False)
-                chunk_content = string_buffer.getvalue()
-
-                if chunk_content.strip():
-                    start_row = i * rows_per_chunk + 1
-                    end_row = start_row + len(df_chunk) - 1
-                    metadata = {
-                        "source": os.path.basename(file_path),
-                        "rows": f"{start_row}-{end_row}",
-                        "file_type": "csv_chunk",
-                    }
-                    docs.append(Document(page_content=chunk_content, metadata=metadata))
+            for i, df_chunk in enumerate(
+                pd.read_csv(file_path, on_bad_lines="skip", chunksize=rows_per_chunk, low_memory=True)
+            ):
+                buf = io.StringIO()
+                df_chunk.to_csv(buf, index=False)
+                content = buf.getvalue().strip()
+                if content:
+                    start = i * rows_per_chunk + 1
+                    docs.append(Document(
+                        page_content=content,
+                        metadata={
+                            "source": os.path.basename(file_path),
+                            "rows": f"{start}-{start + len(df_chunk) - 1}",
+                            "file_type": "csv_chunk",
+                        },
+                    ))
         except Exception as e:
             print(f"Error loading CSV {file_path}: {e}")
         return docs
 
     def load_excel(self, file_path: str) -> list[Document]:
         """
-        Processes each sheet in an Excel file.
+        Each sheet is treated as a named section; within a sheet,
+        further splitting uses the plain-text path if the sheet is large.
         """
         docs = []
         try:
             xls = pd.ExcelFile(file_path)
             for sheet_name in xls.sheet_names:
                 df = pd.read_excel(file_path, sheet_name=sheet_name)
-                # Combine all rows of a sheet into one text block
                 sheet_text = df.to_string()
                 metadata = {
                     "source": os.path.basename(file_path),
                     "sheet": sheet_name,
                     "file_type": "excel",
                 }
-                docs.extend(self._create_documents_from_text(sheet_text, metadata))
+                # Treat each sheet as a single named section
+                docs.extend(self.splitter.split_sections(
+                    [(sheet_name, sheet_text)], metadata
+                ))
         except Exception as e:
             print(f"Error loading Excel {file_path}: {e}")
         return docs
 
-    # --- TXT Loader (ADDED) ---
     def load_txt(self, file_path: str) -> list[Document]:
-        """Extracts text from a standard .txt file."""
         try:
             with open(file_path, "r", encoding="utf-8") as f:
-                full_text = f.read()
+                text = f.read()
         except Exception as e:
             print(f"Error loading TXT {file_path}: {e}")
             return []
-        
+
         metadata = {"source": os.path.basename(file_path), "file_type": "txt"}
-        return self._create_documents_from_text(full_text, metadata)
+        return self.splitter.split_plain_text(text, metadata)
+
+    # ------------------------------------------------------------------
+    # Dispatcher
+    # ------------------------------------------------------------------
 
     def load_document(self, file_path: str) -> list[Document]:
-        """Public method to load a single document based on its extension."""
         ext = Path(file_path).suffix.lower()
-        if ext == ".pdf":
-            return self.load_pdf(file_path)
-        if ext == ".docx":
-            return self.load_docx(file_path)
-        if ext == ".csv":
-            return self.load_csv(file_path)
-        if ext in {".xlsx", ".xls"}:
-            return self.load_excel(file_path)
-        if ext == ".txt":
-            return self.load_txt(file_path)
-        if ext in {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}: 
-            return self.load_image(file_path)
-            
+        dispatch = {
+            ".pdf":  self.load_pdf,
+            ".docx": self.load_docx,
+            ".csv":  self.load_csv,
+            ".xlsx": self.load_excel,
+            ".xls":  self.load_excel,
+            ".txt":  self.load_txt,
+            ".png":  self.load_image,
+            ".jpg":  self.load_image,
+            ".jpeg": self.load_image,
+            ".bmp":  self.load_image,
+            ".tiff": self.load_image,
+        }
+        loader = dispatch.get(ext)
+        if loader:
+            return loader(file_path)
         print(f"Unsupported file type: {ext}")
         return []
+    
+    
+    
+def dump_chunks_to_file(
+    docs: list,
+    output_path: str = "vector.txt",
+    encoding: str = "utf-8",
+) -> None:
+    """
+    Write every document chunk along with its metadata to a plain-text file.
+
+    Format per chunk:
+    ================================================================================
+    CHUNK 1
+    --------------------------------------------------------------------------------
+    SOURCE   : report.pdf
+    FILE TYPE: pdf
+    SECTION  : Introduction
+    PAGE     : 1                  (only present when available)
+    ROWS     : 1-250              (only present for CSV chunks)
+    SHEET    : Sheet1             (only present for Excel chunks)
+    CHARS    : 843
+    --------------------------------------------------------------------------------
+    <chunk text here>
+    ================================================================================
+
+    Parameters
+    ----------
+    docs        : list of langchain Document objects produced by MultiFormatDocumentLoader
+    output_path : destination file path  (default: "vector.txt")
+    encoding    : file encoding          (default: "utf-8")
+    """
+
+    # Metadata keys that get a dedicated labelled row (in display order).
+    # Any extra keys not listed here are still printed under "OTHER METADATA".
+    KNOWN_KEYS = ["source", "file_type", "section", "page", "rows", "sheet"]
+    LABELS = {
+        "source":    "SOURCE   ",
+        "file_type": "FILE TYPE",
+        "section":   "SECTION  ",
+        "page":      "PAGE     ",
+        "rows":      "ROWS     ",
+        "sheet":     "SHEET    ",
+    }
+
+    WIDE  = "=" * 80
+    THIN  = "-" * 80
+
+    with open(output_path, "w", encoding=encoding) as f:
+        f.write(f"TOTAL CHUNKS: {len(docs)}\n")
+        f.write(WIDE + "\n\n")
+
+        for idx, doc in enumerate(docs, start=1):
+            meta = doc.metadata or {}
+            content = doc.page_content or ""
+
+            f.write(WIDE + "\n")
+            f.write(f"CHUNK {idx}\n")
+            f.write(THIN + "\n")
+
+            # Known metadata fields
+            for key in KNOWN_KEYS:
+                if key in meta:
+                    label = LABELS[key]
+                    f.write(f"{label}: {meta[key]}\n")
+
+            # Char count
+            f.write(f"CHARS    : {len(content)}\n")
+
+            # Any extra/unknown metadata keys
+            extra = {k: v for k, v in meta.items() if k not in KNOWN_KEYS}
+            if extra:
+                f.write(f"OTHER    : {extra}\n")
+
+            f.write(THIN + "\n")
+            f.write(content)
+            f.write("\n" + WIDE + "\n\n")
+
+    print(f"✅ Dumped {len(docs)} chunks → {output_path}")

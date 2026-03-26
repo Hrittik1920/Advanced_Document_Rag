@@ -65,7 +65,7 @@ def log_debug(message: str):
 
 logger = logging.getLogger("timing_logger")
 # --- Your Existing RAG and LangChain Imports ---
-from vector import retriever
+from retriever import retriever
 import fitz
 
 from langchain_core.chat_history import BaseChatMessageHistory
@@ -228,6 +228,10 @@ async def run_llm_logic(sid, data: dict):
         ---------------------
         """
     log_debug(final_prompt_preview)
+    
+    # Initialize final_citations to empty list BEFORE try block
+    final_citations = []
+    
     try:
         async for chunk in chain_with_history.astream(
             {"context": context, "question": user_query},
@@ -239,16 +243,35 @@ async def run_llm_logic(sid, data: dict):
             if chunk_text:
                 await sio.emit("chat_stream_chunk", {"chunk": chunk_text}, to=sid)
 
-        # Signal completion
-        used_ids_matches = re.findall(r'[\[【](\d+)[\]】]', full_response)
-        used_ids = {int(idx) for idx in used_ids_matches}
-        final_citations = [c for c in citation if c["id"] in used_ids]
-        await sio.emit("chat_stream_end", {"message": "Stream complete", "citation" : final_citations}, to=sid)
+        # Signal completion - extract citations from response
+        try:
+            used_ids_matches = re.findall(r'[\[【](\d+)[\]】]', full_response)
+            used_ids = set()
+            for idx_str in used_ids_matches:
+                try:
+                    used_ids.add(int(idx_str))
+                except (ValueError, TypeError):
+                    log_debug(f"⚠️ Could not convert citation index '{idx_str}' to int")
+                    continue
+            
+            # Filter citations that were actually used in response
+            if used_ids:
+                final_citations = [c for c in citation if c["id"] in used_ids]
+                
+        except Exception as cite_error:
+            log_debug(f"⚠️ Error extracting citations: {cite_error}")
+            final_citations = citation  # fallback to all citations
+        
+        await sio.emit("chat_stream_end", {"message": "Stream complete", "citation": final_citations}, to=sid)
         log_debug(f"Final Response Preview: {full_response[:500]}")
         log_debug(f"Response Length: {len(full_response)} chars")
+        log_debug(f"Citations sent: {len(final_citations)}")
         
     except Exception as e:
         log_debug(f"Error during streaming: {e}")
+        log_debug(f"Error type: {type(e).__name__}")
+        import traceback
+        log_debug(f"Traceback: {traceback.format_exc()}")
         await sio.emit("error", {"message": f"Stream error: {str(e)}"}, to=sid)
 
 @sio.on("stop_generation")

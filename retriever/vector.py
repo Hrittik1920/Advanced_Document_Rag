@@ -13,8 +13,9 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from tqdm import tqdm
 
-from data_loader import MultiFormatDocumentLoader
+from data_loader import MultiFormatDocumentLoader, dump_chunks_to_file
 from config import settings
+from .knowledge_graph import build_graph_retriever, GraphRetriever   # ← new
 
 # ─────────────────────────────────────────────
 # Configuration
@@ -32,7 +33,8 @@ RERANKER_MODEL  = settings.CROSS_ENCODER_MODEL
 # Stage 1 — how many candidates each retriever returns before fusion
 BM25_CANDIDATES   = 50
 VECTOR_CANDIDATES = 50
-# Stage 3 — final docs returned after reranking
+GRAPH_CANDIDATES  = 30      # ← new
+# Stage 3 — final docs after reranking
 FINAL_TOP_K = 10
 
 
@@ -114,19 +116,21 @@ class _Document:
 @dataclass
 class HybridRetriever:
     """
-    Three-stage retrieval pipeline:
-      1. BM25 (sparse)  ──┐
-                          ├─→ Reciprocal Rank Fusion ─→ candidate pool
-      2. Dense (Chroma) ──┘
-      3. Cross-encoder reranker ─→ final top-k
+    Four-stage retrieval pipeline:
+      1a. BM25 (sparse)     ──┐
+      1b. Dense (Chroma)    ──┼─→ Reciprocal Rank Fusion ─→ candidate pool
+      1c. Knowledge Graph   ──┘
+      2.  Cross-encoder reranker ─→ final top-k
     """
     corpus: List[dict]            # [{"content": str, "metadata": dict}]
     bm25: BM25Okapi
     vector_store: Chroma
     reranker: CrossEncoder
+    graph_retriever: GraphRetriever         # ← new
     k: int                  = FINAL_TOP_K
     bm25_candidates: int    = BM25_CANDIDATES
     vector_candidates: int  = VECTOR_CANDIDATES
+    graph_candidates: int   = GRAPH_CANDIDATES  # ← new
 
     # ── Public interface (LangChain-compatible) ──
 
@@ -145,14 +149,12 @@ class HybridRetriever:
     # ── Internal pipeline ────────────────────────
 
     def _retrieve(self, query: str) -> List[_Document]:
-        # Stage 1a: BM25 candidates
-        bm25_results  = self._bm25_search(query)
+        bm25_results   = self._bm25_search(query)
+        dense_results  = self._dense_search(query)
+        graph_results  = self._graph_search(query)          # ← new
 
-        # Stage 1b: Dense vector candidates
-        dense_results = self._dense_search(query)
-
-        # Stage 2: Reciprocal Rank Fusion
-        fused = self._reciprocal_rank_fusion(bm25_results, dense_results)
+        # 3-way RRF
+        fused = self._reciprocal_rank_fusion(bm25_results, dense_results, graph_results)
 
         if not fused:
             return []
@@ -183,6 +185,35 @@ class HybridRetriever:
             _Document(page_content=r.page_content, metadata=r.metadata)
             for r in results
         ]
+
+    # ── Stage 1c: Knowledge graph  ──────────────────────────────────────────  ← new
+    #
+    #  The GraphRetriever returns chunks reachable within hop_depth hops of any
+    #  entity mentioned in the query.  This gives us chunks that BM25 and dense
+    #  both miss because they don't share keywords or embedding neighbourhood
+    #  with the query — they're connected only through a shared entity.
+    #
+    #  Examples of what this recovers:
+    #   • A chunk that defines "Protocol X" when the query asks what company
+    #     invented "Protocol X" — linked via the ORG entity.
+    #   • Cross-document summaries: chunk A mentions Person P; chunk B (different
+    #     doc) also mentions Person P — both bubble up together.
+    #   • Multi-hop: query about "ACME–Globex partnership" surfaces chunks that
+    #     each mention only one of the two orgs but co-occur with the same third
+    #     entity (a product), linking them through 2 hops.
+
+    def _graph_search(self, query: str) -> List[_Document]:
+        if self.graph_retriever is None:
+            return []
+        try:
+            results = self.graph_retriever.invoke(query)
+            return results[: self.graph_candidates]
+        except Exception as exc:
+            # Graph retrieval is best-effort; never crash the pipeline
+            print(f"[GraphRetriever] warning: {exc}")
+            return []
+
+    # ── Stage 2: Reciprocal Rank Fusion ────────────────────────────────────
 
     @staticmethod
     def _reciprocal_rank_fusion(
@@ -217,7 +248,7 @@ class HybridRetriever:
 # ─────────────────────────────────────────────
 
 def initialize_retriever() -> HybridRetriever:
-    print("Initializing Hybrid Retriever (BM25 + Dense + Reranker)...")
+    print("Initializing Hybrid Retriever (BM25 + Dense + KG +Reranker)...")
 
     loader       = MultiFormatDocumentLoader()
     file_hashes  = load_file_hashes()
@@ -246,6 +277,7 @@ def initialize_retriever() -> HybridRetriever:
             print(f"\n  Change detected: {fpath}")
             docs_to_add.extend(loader.load_document(fpath))
             updated_hashes[fpath] = new_hash
+    dump_chunks_to_file(docs_to_add, output_path="vector.txt")
 
     # ── Handle deleted files ──────────────────
     deleted = set(file_hashes.keys()) - current_files
@@ -310,6 +342,10 @@ def initialize_retriever() -> HybridRetriever:
     tokenized = [tokenize(c["content"]) for c in corpus]
     bm25 = BM25Okapi(tokenized)
 
+    # ── Build / update knowledge graph ───────     ← new
+    print("Building Knowledge Graph …")
+    graph_ret = build_graph_retriever(corpus)
+
     # ── Load cross-encoder reranker ───────────
     print(f"Loading reranker: {RERANKER_MODEL} ...")
     reranker = CrossEncoder(RERANKER_MODEL)
@@ -318,6 +354,7 @@ def initialize_retriever() -> HybridRetriever:
     print(f"  Corpus        : {len(corpus)} chunks")
     print(f"  BM25 pool     : top {BM25_CANDIDATES}")
     print(f"  Vector pool   : top {VECTOR_CANDIDATES}")
+    print(f"  Graph pool    : top {GRAPH_CANDIDATES}")
     print(f"  Final top-k   : {FINAL_TOP_K} (after reranking)\n")
 
     return HybridRetriever(
@@ -325,6 +362,7 @@ def initialize_retriever() -> HybridRetriever:
         bm25=bm25,
         vector_store=vector_store,
         reranker=reranker,
+        graph_retriever=graph_ret,      # ← new
     )
 
 

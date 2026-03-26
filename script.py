@@ -9,7 +9,7 @@ from llm_clients import query_ollama
 
 # --- Configuration ---
 MODEL_NAME = settings.LLM_MODEL_NAME
-MAX_CONTEXT_CHARS = 8_000
+MAX_CONTEXT_CHARS = 30_000
 HISTORY_KEY = settings.HISTORY_DIR
 # --- Model ---
 model =OllamaLLM(model=MODEL_NAME, streaming=True)

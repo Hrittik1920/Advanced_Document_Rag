@@ -17,3 +17,4 @@ test_documents/
 logs/
 chat_history/
 hybrid_db/
+*.txt

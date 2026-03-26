@@ -70,6 +70,8 @@ dependencies = [
     "elastic-transport==8.17.1",
     "elasticsearch==9.0.1",
     "emoji==2.14.1",
+    "en-core-web-md",
+    "en-core-web-sm",
     "et-xmlfile==2.0.0",
     "events==0.5",
     "executing==2.2.0",
@@ -316,6 +318,7 @@ dependencies = [
     "socksio==1.0.0",
     "soundfile==0.13.1",
     "soupsieve==2.7",
+    "spacy>=3.7.2,<3.8.0",
     "sqlalchemy==2.0.38",
     "stack-data==0.6.3",
     "starlette==0.45.3",
@@ -363,3 +366,7 @@ dependencies = [
     "zipp==3.23.0",
     "zstandard==0.23.0",
 ]
+
+[tool.uv.sources]
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+en-core-web-md = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.7.1/en_core_web_md-3.7.1-py3-none-any.whl" }
