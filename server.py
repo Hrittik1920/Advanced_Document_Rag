@@ -111,7 +111,7 @@ class FileChatMessageHistory(BaseChatMessageHistory):
             with open(self.file_path, "r", encoding="utf-8") as f:
                 try:
                     dicts = json.load(f)
-                    current_messages = messages_from_dict(json.load(f))
+                    current_messages = messages_from_dict(dicts)
                 except json.JSONDecodeError:
                     current_messages = []
         current_messages.extend(messages)

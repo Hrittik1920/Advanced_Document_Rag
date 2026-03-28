@@ -70,8 +70,8 @@ def format_documents(docs: list) -> str:
         page_num = doc.metadata.get('page', 0) 
         if 'page' in doc.metadata:
             location_parts.append(f"Page {page_num}")
-        if 'row' in doc.metadata:
-            location_parts.append(f"Row {doc.metadata['row']}")
+        if 'rows' in doc.metadata:
+            location_parts.append(f"Row {doc.metadata['rows']}")
             
         location_str = ", ".join(location_parts)
         snippet = doc.page_content.strip()
@@ -91,7 +91,7 @@ def format_documents(docs: list) -> str:
             "display_name": file_name,
             "file_path": raw_source, 
             "page": page_num,
-            "row": doc.metadata.get("row"),
+            "rows": doc.metadata.get("rows"),
             "topic": topic,
         })
     return "\n\n".join(formatted), citation

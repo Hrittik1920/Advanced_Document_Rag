@@ -8,7 +8,6 @@ import pytesseract
 import numpy as np
 import pandas as pd
 from langchain_core.documents import Document
-import PyPDF2
 from pathlib import Path
 from PIL import Image
 from pdf2image import convert_from_path
@@ -17,6 +16,7 @@ from docx.oxml.ns import qn
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import hashlib
 import uuid
+import fitz
 
 from llm_clients import query_ollama
 
@@ -43,7 +43,7 @@ class HeaderAwareTextSplitter:
     subdivided, so that long sections don't lose context at split boundaries.
     """
 
-    MAX_SECTION_CHARS = 3000   # Sections larger than this get sub-split
+    MAX_SECTION_CHARS = 1200   # Sections larger than this get sub-split
     FALLBACK_OVERLAP  = 80     # Overlap used *only* inside over-long sections
 
     def __init__(self):
@@ -118,11 +118,14 @@ _MARKDOWN_HEADER_RE = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
 # Matches: "1.2.3  Some Title", "CHAPTER 3 — INTRO", all-caps short lines
 _GENERIC_HEADER_RE = re.compile(
     r"^(?:"
-    r"(?:\d+[\.\d]*\s+[A-Z].{3,60})"      # Numbered: "1.2 Section Title"
-    r"|(?:[A-Z][A-Z\s\-]{4,60}[A-Z])"      # ALL CAPS line
-    r"|(?:(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+.*)"  # Keyword + number
+    # Numbered: "1.2 Section Title" (Allows for extra spaces from OCR)
+    r"(?:\d+[.\d]+\s+[A-Z].{3,60})" 
+    # ALL CAPS line (Allows numbers and symbols like '&' often found in headers)
+    r"|(?:[A-Z0-9][A-Z0-9\s\-&]{4,60}[A-Z0-9])" 
+    # Keyword + number (Accounts for OCR missing the space, e.g., "Chapter3")
+    r"|(?:(?:Chapter|Section|Part|Appendix)\s*[\dIVXivx]+.?)" 
     r")$",
-    re.MULTILINE,
+    re.MULTILINE | re.IGNORECASE, # Added ignorecase for 'chapter' vs 'Chapter'
 )
 
 
@@ -258,29 +261,33 @@ class MultiFormatDocumentLoader:
         confidence = 0
 
         try:
-            img = cv2.imread(file_path)
-            if img is not None:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                ocr_data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DICT)
-                ocr_text = pytesseract.image_to_string(thresh).strip()
-                confidences = [int(c) for c in ocr_data["conf"] if int(c) != -1]
-                confidence = sum(confidences) / len(confidences) if confidences else 0
+            def run_tesseract():
+                img = cv2.imread(file_path)
+                if img is not None:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    ocr_data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DICT)
+                    ocr_text = pytesseract.image_to_string(thresh).strip()
+                    confidences = [int(c) for c in ocr_data["conf"] if int(c) != -1]
+                    confidence = sum(confidences) / len(confidences) if confidences else 0
+                    return ocr_text, confidence
+            ocr_text, confidence = await asyncio.to_thread(run_tesseract)
         except Exception as e:
             print(f"⚠️  Tesseract failed for {origin_info}: {e}")
 
         if self._should_use_vlm_fallback(ocr_text, confidence):
             print(f"🔄 Low quality OCR for {origin_info}. Falling back to VLM...")
             try:
-                response_gen = await query_ollama(
-                    prompt="Extract all readable text from this image. Return only the text content.",
-                    model="deepseek-ocr:latest",
+                response_gen = query_ollama(
+                    prompt="Extract all readable text from this image. Return only the text content.\n And return the document with markdown too as per shown in the image",
+                    model="codez-ocr:latest",
                     image_path=file_path,
                     keep_alive=0,
+                    stream=False
                 )
                 parts = []
                 async for chunk in response_gen:
-                    parts.append(chunk.get("message", {}).get("content", ""))
+                    parts.append(chunk)
                 ocr_text = "".join(parts).strip()
             except Exception as e:
                 print(f"❌ VLM fallback failed: {e}")
@@ -327,10 +334,9 @@ class MultiFormatDocumentLoader:
 
         combined_text = ""
         try:
-            with open(file_path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                for page in reader.pages:
-                    combined_text += page.extract_text() or ""
+            with fitz.open(file_path) as f:
+                for page in f:
+                    combined_text += page.get_text() or "\n\n"
         except Exception as e:
             print(f"Error reading PDF {file_path}: {e}")
             return []
@@ -348,8 +354,9 @@ class MultiFormatDocumentLoader:
         try:
             images = convert_from_path(file_path)
             for i, img in enumerate(images):
-                temp_path = f"temp_{os.getpid()}_{i}.png"
-                img.save(temp_path, "PNG")
+                temp_path = f"temp_{os.getpid()}_{i}.jpg"
+                img = img.convert('RGB')
+                img.save(temp_path, "JPEG", quality=90)
                 page_text = self._run_async_ocr(temp_path, f"Page {i + 1}")
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
@@ -468,36 +475,19 @@ def dump_chunks_to_file(
     docs: list,
     output_path: str = "vector.txt",
     encoding: str = "utf-8",
+    no_change: bool = False  # Default to False so it dumps by default
 ) -> None:
     """
     Write every document chunk along with its metadata to a plain-text file.
-
-    Format per chunk:
-    ================================================================================
-    CHUNK 1
-    --------------------------------------------------------------------------------
-    SOURCE   : report.pdf
-    FILE TYPE: pdf
-    SECTION  : Introduction
-    PAGE     : 1                  (only present when available)
-    ROWS     : 1-250              (only present for CSV chunks)
-    SHEET    : Sheet1             (only present for Excel chunks)
-    CHARS    : 843
-    --------------------------------------------------------------------------------
-    <chunk text here>
-    ================================================================================
-
-    Parameters
-    ----------
-    docs        : list of langchain Document objects produced by MultiFormatDocumentLoader
-    output_path : destination file path  (default: "vector.txt")
-    encoding    : file encoding          (default: "utf-8")
     """
+    if no_change:
+        print(f"⏩ Skipping chunk dump (no_change=True).")
+        return
 
-    # Metadata keys that get a dedicated labelled row (in display order).
-    # Any extra keys not listed here are still printed under "OTHER METADATA".
-    KNOWN_KEYS = ["source", "file_type", "section", "page", "rows", "sheet"]
+    # 1. Added chunk_id to KNOWN_KEYS to expose the hash you generated
+    KNOWN_KEYS = ["chunk_id", "source", "file_type", "section", "page", "rows", "sheet"]
     LABELS = {
+        "chunk_id":  "CHUNK ID ", # Added label
         "source":    "SOURCE   ",
         "file_type": "FILE TYPE",
         "section":   "SECTION  ",
@@ -509,7 +499,8 @@ def dump_chunks_to_file(
     WIDE  = "=" * 80
     THIN  = "-" * 80
 
-    with open(output_path, "w", encoding=encoding) as f:
+    # 2. Added errors="replace" to prevent weird OCR characters from crashing the dump
+    with open(output_path, "w", encoding=encoding, errors="replace") as f:
         f.write(f"TOTAL CHUNKS: {len(docs)}\n")
         f.write(WIDE + "\n\n")
 

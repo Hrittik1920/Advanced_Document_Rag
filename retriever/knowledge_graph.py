@@ -41,7 +41,7 @@ RELEVANT_LABELS: Set[str] = {
 }
 
 # How many hops to expand from a matched entity node
-DEFAULT_HOP_DEPTH  = 2
+DEFAULT_HOP_DEPTH  = 3
 # Max chunks returned by the graph retriever per query
 GRAPH_CANDIDATES   = 30
 
@@ -340,12 +340,19 @@ class GraphRetriever:
     def get_relevant_documents(self, query: str) -> List[Any]:
         return self._retrieve(query)
 
+    # Add this new method that the HybridRetriever is looking for:
+    def invoke_with_scores(self, query: str) -> List[Tuple[Any, float]]:
+        return self._retrieve_with_scores(query)
+
     # ── Core logic ────────────────────────────────────────────────────────────
 
     def _retrieve(self, query: str) -> List[Any]:
+        """LangChain compatible method (drops the scores)."""
+        return [doc for doc, score in self._retrieve_with_scores(query)]
+
+    def _retrieve_with_scores(self, query: str) -> List[Tuple[Any, float]]:
         """
-        Returns _Document-like objects (page_content + metadata).
-        Importing _Document here to avoid circular deps; caller can import too.
+        Returns _Document-like objects along with their graph proximity score.
         """
         from retriever import _Document  # local import to keep this file standalone
 
@@ -411,19 +418,19 @@ class GraphRetriever:
         if not chunk_scores:
             return []
 
-        # Step 5: rank and return top_k
+        # Step 5: rank and return top_k ALONG WITH SCORES
         ranked = sorted(chunk_scores.items(), key=lambda x: x[1], reverse=True)[: self.top_k]
 
-        docs = []
-        for node_id, _ in ranked:
+        results = []
+        for node_id, score in ranked:
             nd = self.G.nodes[node_id]
-            docs.append(
-                _Document(
-                    page_content=nd["content"],
-                    metadata=nd["metadata"],
-                )
+            doc = _Document(
+                page_content=nd["content"],
+                metadata=nd["metadata"],
             )
-        return docs
+            results.append((doc, score)) # Append the tuple!
+            
+        return results
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
