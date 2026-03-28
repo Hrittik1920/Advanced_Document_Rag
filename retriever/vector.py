@@ -30,12 +30,14 @@ COLLECTION_NAME     = "multi_format_documents"
 EMBEDDINGS      = OllamaEmbeddings(model=settings.LLM_EMBEDDING_MODEL)
 RERANKER_MODEL  = settings.CROSS_ENCODER_MODEL
 
-# Stage 1 — how many candidates each retriever returns before fusion
-BM25_CANDIDATES   = 50
-VECTOR_CANDIDATES = 50
-GRAPH_CANDIDATES  = 30      # ← new
+# Stage 1 — how many candidates each retriever returns before fusion on the basis of thresolds
+BM25_SCORE_RATIO   = 0.5
+VECTOR_SIMILARITY_THRESOLD = 0.7
+GRAPH_SCORE_THRESHOLD  = 0.6      # ← new
 # Stage 3 — final docs after reranking
-FINAL_TOP_K = 10
+MAX_CANDIDATES_PER_RETRIEVER = 100
+RERANKER_THRESHOLD=0.1
+FINAL_TOP_K = 15
 
 
 # ─────────────────────────────────────────────
@@ -128,9 +130,10 @@ class HybridRetriever:
     reranker: CrossEncoder
     graph_retriever: GraphRetriever         # ← new
     k: int                  = FINAL_TOP_K
-    bm25_candidates: int    = BM25_CANDIDATES
-    vector_candidates: int  = VECTOR_CANDIDATES
-    graph_candidates: int   = GRAPH_CANDIDATES  # ← new
+    bm25_score_ratio: int    = BM25_SCORE_RATIO
+    vector_similarity_thresold: int  = VECTOR_SIMILARITY_THRESOLD
+    graph_score_thresold: int   = GRAPH_SCORE_THRESHOLD  # ← new
+    max_candidates_per_retriever:int =MAX_CANDIDATES_PER_RETRIEVER
 
     # ── Public interface (LangChain-compatible) ──
 
@@ -167,23 +170,38 @@ class HybridRetriever:
             return []
         tokens = tokenize(query)
         scores = self.bm25.get_scores(tokens)
-        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
-            : self.bm25_candidates
-        ]
+        
+        if not len(scores):
+            return []
+            
+        max_score = max(scores)
+        if max_score <= 0:
+            return []
+
+        # Dynamic relative threshold
+        threshold = max_score * self.bm25_score_ratio
+        
+        # Filter and sort
+        valid_indices = [i for i, s in enumerate(scores) if s >= threshold]
+        valid_indices.sort(key=lambda i: scores[i], reverse=True)
+        
+        # Apply a generous upper limit for safety before RRF
+        valid_indices = valid_indices[:self.max_candidates_per_retriever]
+
         return [
             _Document(
                 page_content=self.corpus[i]["content"],
-                metadata=self.corpus[i]["metadata"],
+                metadata=self.corpus[i]["metadata"]
             )
-            for i in top_idx
-            if scores[i] > 0
+            for i in valid_indices
         ]
 
     def _dense_search(self, query: str) -> List[_Document]:
-        results = self.vector_store.similarity_search(query, k=self.vector_candidates)
+        results = self.vector_store.similarity_search_with_relevance_scores(query, k=self.max_candidates_per_retriever)
         return [
             _Document(page_content=r.page_content, metadata=r.metadata)
-            for r in results
+            for r, score in results
+            if score>= self.vector_similarity_thresold
         ]
 
     # ── Stage 1c: Knowledge graph  ──────────────────────────────────────────  ← new
@@ -206,8 +224,20 @@ class HybridRetriever:
         if self.graph_retriever is None:
             return []
         try:
-            results = self.graph_retriever.invoke(query)
-            return results[: self.graph_candidates]
+            # Assuming your graph_retriever can return scores (e.g., PageRank or edge weight)
+            # If it only returns raw docs, you may have to threshold by hop-distance instead.
+            results = self.graph_retriever.invoke_with_scores(query) 
+            
+            valid_docs = [
+                doc for doc, score in results 
+                if score >= self.graph_score_thresold
+            ]
+            return valid_docs[:self.max_candidates_per_retriever]
+            
+        except AttributeError:
+             # Fallback if your GraphRetriever doesn't support scores
+             print("[GraphRetriever] Warning: No score mechanism found. Returning top-K.")
+             return self.graph_retriever.invoke(query)[:30]
         except Exception as exc:
             # Graph retrieval is best-effort; never crash the pipeline
             print(f"[GraphRetriever] warning: {exc}")
@@ -237,16 +267,20 @@ class HybridRetriever:
         return [docs[key] for key in merged]
 
     def _rerank(self, query: str, candidates: List[_Document]) -> List[_Document]:
-        pairs    = [[query, d.page_content] for d in candidates]
+        if not candidates:
+            return []
+            
+        pairs = [[query, d.page_content] for d in candidates]
         r_scores = self.reranker.predict(pairs, show_progress_bar=False)
-        ranked   = sorted(zip(r_scores, candidates), key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in ranked[: self.k]]
-
-
-# ─────────────────────────────────────────────
-# Initialisation
-# ─────────────────────────────────────────────
-
+        
+        # Filter purely by cross-encoder threshold
+        ranked = sorted(zip(r_scores, candidates), key=lambda x: x[0], reverse=True)
+        
+        final_docs = [doc for score, doc in ranked if score >= RERANKER_THRESHOLD]
+        
+        # Optional: Apply absolute cap to avoid flooding the LLM context window
+        return final_docs[:FINAL_TOP_K]
+    
 def initialize_retriever() -> HybridRetriever:
     print("Initializing Hybrid Retriever (BM25 + Dense + KG +Reranker)...")
 
@@ -352,9 +386,9 @@ def initialize_retriever() -> HybridRetriever:
 
     print("\nHybrid retriever ready!")
     print(f"  Corpus        : {len(corpus)} chunks")
-    print(f"  BM25 pool     : top {BM25_CANDIDATES}")
-    print(f"  Vector pool   : top {VECTOR_CANDIDATES}")
-    print(f"  Graph pool    : top {GRAPH_CANDIDATES}")
+    print(f"  BM25 pool     : top {BM25_SCORE_RATIO}")
+    print(f"  Vector pool   : top {VECTOR_SIMILARITY_THRESOLD}")
+    print(f"  Graph pool    : top {GRAPH_SCORE_THRESHOLD}")
     print(f"  Final top-k   : {FINAL_TOP_K} (after reranking)\n")
 
     return HybridRetriever(
