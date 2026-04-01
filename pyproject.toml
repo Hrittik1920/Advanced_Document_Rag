@@ -325,6 +325,7 @@ dependencies = [
     "starlette==0.45.3",
     "starlette-compress==1.6.0",
     "sympy==1.14.0",
+    "tabulate>=0.10.0",
     "tenacity==8.5.0",
     "tencentcloud-sdk-python==3.0.1336",
     "threadpoolctl==3.6.0",
