@@ -10,8 +10,11 @@ from typing import List, Optional
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 from langchain_ollama import OllamaEmbeddings
-from langchain_chroma import Chroma
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
 from tqdm import tqdm
+import uuid
 
 from data_loader import MultiFormatDocumentLoader, dump_chunks_to_file
 from config import settings
@@ -22,6 +25,7 @@ from .knowledge_graph import build_graph_retriever, GraphRetriever   # ← new
 # ─────────────────────────────────────────────
 
 DOCUMENTS_DIRECTORY = settings.DOCUMENTS_DIR
+QDRANT_URL = settings.QDRANT_URL
 DB_LOCATION         = "./hybrid_db"
 FILE_HASH_DB        = os.path.join(DB_LOCATION, "file_hashes.json")
 BM25_INDEX_FILE     = os.path.join(DB_LOCATION, "bm25_index.pkl")
@@ -31,9 +35,9 @@ EMBEDDINGS      = OllamaEmbeddings(model=settings.LLM_EMBEDDING_MODEL)
 RERANKER_MODEL  = settings.CROSS_ENCODER_MODEL
 
 # Stage 1 — how many candidates each retriever returns before fusion on the basis of thresolds
-BM25_SCORE_RATIO   = 0.5
-VECTOR_SIMILARITY_THRESOLD = 0.7
-GRAPH_SCORE_THRESHOLD  = 0.6      # ← new
+BM25_SCORE_RATIO   = 0.4
+VECTOR_SIMILARITY_THRESOLD = 0.6
+GRAPH_SCORE_THRESHOLD  = 0.4      # ← new
 # Stage 3 — final docs after reranking
 MAX_CANDIDATES_PER_RETRIEVER = 100
 RERANKER_THRESHOLD=0.1
@@ -63,12 +67,12 @@ def get_file_hash(path: str) -> Optional[str]:
 
 def doc_id(doc) -> str:
     key = f"{doc.metadata.get('source','')}{doc.metadata.get('chunk_number',0)}{doc.page_content}"
-    return hashlib.sha256(key.encode()).hexdigest()
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))  # Using UUID5 for consistent hashing
 
 
 def corpus_doc_id(c: dict) -> str:
     key = f"{c['metadata'].get('source','')}{c['metadata'].get('chunk_number',0)}{c['content']}"
-    return hashlib.sha256(key.encode()).hexdigest()
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))  # Using UUID5 for consistent hashing
 
 
 # ─── File-hash persistence ───────────────────
@@ -120,20 +124,20 @@ class HybridRetriever:
     """
     Four-stage retrieval pipeline:
       1a. BM25 (sparse)     ──┐
-      1b. Dense (Chroma)    ──┼─→ Reciprocal Rank Fusion ─→ candidate pool
+      1b. Dense (Qdrant)    ──┼─→ Reciprocal Rank Fusion ─→ candidate pool
       1c. Knowledge Graph   ──┘
       2.  Cross-encoder reranker ─→ final top-k
     """
     corpus: List[dict]            # [{"content": str, "metadata": dict}]
     bm25: BM25Okapi
-    vector_store: Chroma
+    vector_store: QdrantVectorStore
     reranker: CrossEncoder
     graph_retriever: GraphRetriever         # ← new
     k: int                  = FINAL_TOP_K
-    bm25_score_ratio: int    = BM25_SCORE_RATIO
-    vector_similarity_thresold: int  = VECTOR_SIMILARITY_THRESOLD
-    graph_score_thresold: int   = GRAPH_SCORE_THRESHOLD  # ← new
-    max_candidates_per_retriever:int =MAX_CANDIDATES_PER_RETRIEVER
+    bm25_score_ratio: float    = BM25_SCORE_RATIO
+    vector_similarity_thresold: float  = VECTOR_SIMILARITY_THRESOLD
+    graph_score_thresold: float   = GRAPH_SCORE_THRESHOLD  # ← new
+    max_candidates_per_retriever: int =MAX_CANDIDATES_PER_RETRIEVER
 
     # ── Public interface (LangChain-compatible) ──
 
@@ -315,19 +319,62 @@ def initialize_retriever() -> HybridRetriever:
 
     # ── Handle deleted files ──────────────────
     deleted = set(file_hashes.keys()) - current_files
+    deleted_chunk_ids = []
+    
     if deleted:
         print(f"Pruning chunks from {len(deleted)} deleted file(s)...")
+        # Identify which chunks belong to the deleted files to remove them from Qdrant later
+        deleted_chunk_ids = [corpus_doc_id(c) for c in corpus if c["metadata"].get("source") in deleted]
+        
         corpus = [c for c in corpus if c["metadata"].get("source") not in deleted]
         existing_ids = {corpus_doc_id(c) for c in corpus}
         for fpath in deleted:
             del updated_hashes[fpath]
 
-    # ── Chroma vector store ───────────────────
-    vector_store = Chroma(
-        collection_name=COLLECTION_NAME,
-        persist_directory=DB_LOCATION,
-        embedding_function=EMBEDDINGS,
-    )
+    # ── Qdrant vector store (Safely Isolated) ──
+    # qdrant_path = os.path.join(DB_LOCATION, "qdrant_data")
+    
+    # Using local Qdrant. Adjust url/api_key here if you use Qdrant Cloud/Docker.
+    client = QdrantClient(url=QDRANT_URL)
+    size = len(EMBEDDINGS.embed_query("test"))
+    print(f"Embedding dimension detected: {size}")
+    try:
+        collections = client.get_collections().collections
+        exists = any(c.name == COLLECTION_NAME for c in collections)
+        
+        if not exists:
+            print(f"Creating collection '{COLLECTION_NAME}'...")
+            client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(
+                    size=size, # Ensure this matches your Ollama model dimensions (e.g., 768 for mxbai-embed-large)
+                    distance=Distance.COSINE
+                ),
+            )
+    except Exception as e:
+        print(f"Error checking/creating Qdrant collection: {e}")
+
+    # Now initialize the store safely
+    try:
+        vector_store = QdrantVectorStore(
+            client=client,
+            collection_name=COLLECTION_NAME,
+            embedding=EMBEDDINGS,
+        )
+    except Exception as e:
+        print(f"Critical error: Could not initialize QdrantVectorStore: {e}")
+        # Re-raise or exit because we cannot proceed without the vector_store
+        raise e
+    # Safely delete orphaned vectors from Qdrant if files were removed
+    if deleted_chunk_ids:
+        print(f"Removing {len(deleted_chunk_ids)} orphaned vectors from Qdrant collection '{COLLECTION_NAME}'...")
+        try:
+            client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=deleted_chunk_ids
+            )
+        except Exception as e:
+            print(f"Warning: Could not delete old points from Qdrant: {e}")
 
     # ── Add new documents ─────────────────────
     if docs_to_add:
