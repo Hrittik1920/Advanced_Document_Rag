@@ -214,6 +214,8 @@ async def run_llm_logic(sid, data: dict):
         context = "No relevant documents found in the knowledge base."
         citation=[]
     preview_context = context[:500] + "..." if len(context) > 500 else context
+    with open("chunk.txt", "w", encoding="utf-8") as f:
+        f.write(context)
     log_debug(f"Context Preview: {preview_context}")
     log_debug(f"Context Length: {len(context)} chars")
     # 2. Streaming Response
