@@ -1,13 +1,14 @@
 import base64
 import aiohttp
 from typing import AsyncGenerator
-
+import json
 async def query_ollama(
     prompt: str, 
     model: str, 
     image_path: str = None, 
     keep_alive: int = 0,
     base_url: str = "http://localhost:11434",
+    num_ctx_tokens: int = 4192,
     stream: bool = True
 ) -> AsyncGenerator[str, None]:
     """
@@ -20,7 +21,8 @@ async def query_ollama(
         "model": model,
         "prompt": prompt,
         "stream": stream,
-        "keep_alive": f"{keep_alive}m" # Ollama accepts '0m', '5m', etc.
+        "keep_alive": f"{keep_alive}m", # Ollama accepts '0m', '5m', etc.
+        "num_ctx_tokens": num_ctx_tokens
     }
     
     # Safely handle the image if provided
@@ -39,17 +41,24 @@ async def query_ollama(
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
                     if stream:
+                        buffer=""
                         # Stream mode: yield chunks as they arrive
-                        async for line in response.content:
-                            if line:
-                                try:
-                                    chunk = line.decode('utf-8')
-                                    import json
-                                    data = json.loads(chunk)
-                                    if 'response' in data:
-                                        yield data['response']
-                                except Exception as e:
-                                    print(f"Error parsing stream chunk: {e}")
+                        async for line in response.content.iter_chunked(1024):
+                            for chunk_line in line.decode('utf-8').split('\n'):
+                                if chunk_line.strip():
+                                    try:
+                                        data = json.loads(chunk_line)
+                                        if 'response' in data:
+                                            yield data['response']
+                                    except json.JSONDecodeError:
+                                        continue
+                        if buffer.strip():
+                            try:
+                                data = json.loads(buffer)
+                                if 'response' in data:
+                                    yield data['response']
+                            except:
+                                pass
                     else:
                         # Non-stream mode: return full response
                         result = await response.json()
