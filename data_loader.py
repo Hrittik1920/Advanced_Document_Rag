@@ -2,6 +2,7 @@ import os
 import io
 import re
 import asyncio
+from config import settings
 import nest_asyncio
 import cv2
 import pytesseract
@@ -44,7 +45,8 @@ class HeaderAwareTextSplitter:
     """
 
     MAX_SECTION_CHARS = 1200   # Sections larger than this get sub-split
-    FALLBACK_OVERLAP  = 80     # Overlap used *only* inside over-long sections
+    FALLBACK_OVERLAP  = 100     # Overlap used *only* inside over-long sections
+    CONTEXT_MODEL = settings.CONTEXT_MODEL
 
     def __init__(self):
         self._fallback_splitter = RecursiveCharacterTextSplitter(
@@ -59,6 +61,28 @@ class HeaderAwareTextSplitter:
         # Hash the source and the first 100 chars of content
         unique_string = f"{source}::{text[:100]}"
         return hashlib.sha256(unique_string.encode('utf-8')).hexdigest()[:12]
+    
+    #Adding contextual ware embed chunk generation using the ollama model
+    async def _generate_chunk_context(self, doc_title: str, section: str, chunk_text: str) -> str:
+        """Generate a 1-2 sentence context prefix that situates this chunk in the document."""
+        prompt = (
+            f"Document: {doc_title}\n"
+            f"Section: {section or 'main body'}\n\n"
+            f"Chunk:\n{chunk_text[:1000]}\n\n"
+            "Write 1-2 sentences explaining what this chunk is about within the document. "
+            "Be specific. Return only those sentences. Do not use conversational filler."
+        )
+        try:
+            # Note: Assuming query_ollama yields text chunks based on your OCR code
+            response_gen = query_ollama(prompt=prompt, model=self.CONTEXT_MODEL, keep_alive=0,num_ctx_tokens=10000, stream=False)
+            parts = []
+            async for chunk in response_gen:
+                parts.append(chunk)
+            return "".join(parts).strip()
+        except Exception as e:
+            print(f"⚠️ Context generation failed: {e}")
+            return ""
+    
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -97,7 +121,68 @@ class HeaderAwareTextSplitter:
                 docs.extend(sub_docs)
 
         return docs
+    
+    def split_sections_with_context(
+        self,
+        sections: list[tuple[str, str]],
+        base_metadata: dict,
+        is_table: bool = False,
+    ) -> list[Document]:
+        """
+        Splits sections and adds an AI-generated context prefix to text chunks.
+        Tables bypass context generation to save massive amounts of compute time.
+        """
+        # First, get the standard docs using your existing logic
+        docs = self.split_sections(sections, base_metadata, is_table=is_table)
+        
+        # If these are tables, skip context generation (they are already self-describing via headers)
+        if is_table:
+            doc_title = base_metadata.get("source", "unknown_document")
+            section = base_metadata.get("section", "Table")
+            
+            for doc in docs:
+                # Manually inject a rigid context prefix for tables
+                doc.metadata["embed_content"] = f"[Source: {doc_title} | Section: {section}]\n\n{doc.page_content}"
+            return docs
 
+        doc_title = base_metadata.get("source", "unknown_document")
+
+        # Create a Semaphore to limit Ollama to processing 4 chunks at a time
+        # Change this number based on your GPU VRAM (lower if it crashes, higher if GPU usage is low)
+        sem = asyncio.Semaphore(2)
+
+        async def bounded_generate(d: Document):
+            async with sem:
+                ctx = await self._generate_chunk_context(
+                    doc_title,
+                    d.metadata.get("section", ""),
+                    d.page_content
+                )
+                return ctx
+
+        async def enrich_all():
+            tasks = [bounded_generate(d) for d in docs]
+            return await asyncio.gather(*tasks)
+
+        # Run the async generation
+        try:
+            loop = asyncio.get_event_loop()
+            contexts = loop.run_until_complete(enrich_all())
+        except RuntimeError:
+            contexts = asyncio.run(enrich_all())
+            raise RuntimeError("No event loop found. Ensure that this code is run in an environment that supports asyncio, such as a Jupyter notebook or an async-capable Python environment.")
+            
+        # Attach the generated context to the documents
+        for doc, ctx in zip(docs, contexts):
+            doc.metadata["context_prefix"] = ctx
+            if ctx:
+                # embed_content is what goes into the Vector DB
+                doc.metadata["embed_content"] = f"[{doc_title} Context: {ctx}]\n\n{doc.page_content}"
+            else:
+                doc.metadata["embed_content"] = doc.page_content
+                
+        return docs
+    
     def split_plain_text(self, text: str, base_metadata: dict) -> list[Document]:
         """
         Detect headers in raw text, then call split_sections.
@@ -462,7 +547,7 @@ class MultiFormatDocumentLoader:
                                             # Label which rows are in this chunk
                                             header = f"Extracted Table {idx + 1} (Page {page_num + 1}, Rows {start_row+1}-{start_row+len(df_chunk)})"
                                             table_docs.extend(
-                                                self.splitter.split_sections([(header, md_table)], table_meta, is_table=True)
+                                                self.splitter.split_sections_with_context([(header, md_table)], table_meta, is_table=True)
                                             )
                             except Exception as e:
                                 print(f"Error extracting table from PDF page: {e}")
@@ -477,7 +562,7 @@ class MultiFormatDocumentLoader:
         text_docs = []
         if len(combined_text.strip()) > 200:
             sections = _extract_pdf_sections(combined_text)
-            text_docs = self.splitter.split_sections(sections, metadata, is_table=False)
+            text_docs = self.splitter.split_sections_with_context(sections, metadata, is_table=False)
         else:
         # Scanned PDF — OCR each page, treat each page as its own section
             print(f"⚠️  Scanned PDF detected: {os.path.basename(file_path)}")
@@ -496,7 +581,7 @@ class MultiFormatDocumentLoader:
                     page_meta = {**metadata, "file_type": "pdf_scanned", "page": i + 1}
                     # Each scanned page is already a natural boundary
                     sections = _detect_text_headers(page_text) or [("", page_text)]
-                    text_docs.extend(self.splitter.split_sections(sections, page_meta))
+                    text_docs.extend(self.splitter.split_sections_with_context(sections, page_meta))
             except Exception as e:
                 print(f"Error during scanned PDF OCR for {file_path}: {e}")
 
@@ -513,8 +598,8 @@ class MultiFormatDocumentLoader:
         metadata = {"source": os.path.basename(file_path), "file_type": "docx"}
         
         # Process text and tables separately to protect the tables
-        docs = self.splitter.split_sections(text_sections, metadata, is_table=False)
-        docs.extend(self.splitter.split_sections(table_sections, metadata, is_table=True))
+        docs = self.splitter.split_sections_with_context(text_sections, metadata, is_table=False)
+        docs.extend(self.splitter.split_sections_with_context(table_sections, metadata, is_table=True))
         return docs
 
     def load_csv(self, file_path: str, rows_per_chunk: int = 250) -> list[Document]:
@@ -618,19 +703,19 @@ def dump_chunks_to_file(
     docs: list,
     output_path: str = "vector.txt",
     encoding: str = "utf-8",
-    no_change: bool = False  # Default to False so it dumps by default
+    no_change: bool = False,
+    mode: str = "w"  # <-- Added mode to allow appending
 ) -> None:
     """
-    Write every document chunk along with its metadata to a plain-text file.
+    Write document chunks along with metadata to a plain-text file.
+    Supports streaming chunks in real-time using mode="a".
     """
-    if no_change:
-        print(f"⏩ Skipping chunk dump (no_change=True).")
+    if no_change or not docs:
         return
 
-    # 1. Added chunk_id to KNOWN_KEYS to expose the hash you generated
     KNOWN_KEYS = ["chunk_id", "source", "file_type", "section", "page", "rows", "sheet"]
     LABELS = {
-        "chunk_id":  "CHUNK ID ", # Added label
+        "chunk_id":  "CHUNK ID ",
         "source":    "SOURCE   ",
         "file_type": "FILE TYPE",
         "section":   "SECTION  ",
@@ -642,17 +727,17 @@ def dump_chunks_to_file(
     WIDE  = "=" * 80
     THIN  = "-" * 80
 
-    # 2. Added errors="replace" to prevent weird OCR characters from crashing the dump
-    with open(output_path, "w", encoding=encoding, errors="replace") as f:
-        f.write(f"TOTAL CHUNKS: {len(docs)}\n")
-        f.write(WIDE + "\n\n")
+    with open(output_path, mode, encoding=encoding, errors="replace") as f:
+        # Only write a main header if we are starting a fresh file
+        if mode == "w":
+            f.write("=== VECTOR CHUNK DUMP ===\n\n")
 
-        for idx, doc in enumerate(docs, start=1):
+        for doc in docs:
             meta = doc.metadata or {}
             content = doc.page_content or ""
 
             f.write(WIDE + "\n")
-            f.write(f"CHUNK {idx}\n")
+            f.write("CHUNK\n")
             f.write(THIN + "\n")
 
             # Known metadata fields
@@ -672,5 +757,3 @@ def dump_chunks_to_file(
             f.write(THIN + "\n")
             f.write(content)
             f.write("\n" + WIDE + "\n\n")
-
-    print(f"✅ Dumped {len(docs)} chunks → {output_path}")

@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     HISTORY_DIR: str
     CROSS_ENCODER_MODEL: str
     QDRANT_URL: str
+    CONTEXT_MODEL: str # New setting for the context model
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8"

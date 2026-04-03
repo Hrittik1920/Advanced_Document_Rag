@@ -34,14 +34,14 @@ COLLECTION_NAME     = "multi_format_documents"
 EMBEDDINGS      = OllamaEmbeddings(model=settings.LLM_EMBEDDING_MODEL)
 RERANKER_MODEL  = settings.CROSS_ENCODER_MODEL
 
-# Stage 1 — how many candidates each retriever returns before fusion on the basis of thresolds
+# Stage 1 — how many candidates each retriever returns before fusion on the basis of thresholds
 BM25_SCORE_RATIO   = 0.4
-VECTOR_SIMILARITY_THRESOLD = 0.6
+VECTOR_SIMILARITY_THRESHOLD = 0.6
 GRAPH_SCORE_THRESHOLD  = 0.4      # ← new
 # Stage 3 — final docs after reranking
 MAX_CANDIDATES_PER_RETRIEVER = 100
 RERANKER_THRESHOLD=0.1
-FINAL_TOP_K = 15
+FINAL_TOP_K = 30
 
 
 # ─────────────────────────────────────────────
@@ -135,8 +135,8 @@ class HybridRetriever:
     graph_retriever: GraphRetriever         # ← new
     k: int                  = FINAL_TOP_K
     bm25_score_ratio: float    = BM25_SCORE_RATIO
-    vector_similarity_thresold: float  = VECTOR_SIMILARITY_THRESOLD
-    graph_score_thresold: float   = GRAPH_SCORE_THRESHOLD  # ← new
+    vector_similarity_threshold: float  = VECTOR_SIMILARITY_THRESHOLD
+    graph_score_threshold: float   = GRAPH_SCORE_THRESHOLD  # ← new
     max_candidates_per_retriever: int =MAX_CANDIDATES_PER_RETRIEVER
 
     # ── Public interface (LangChain-compatible) ──
@@ -205,7 +205,7 @@ class HybridRetriever:
         return [
             _Document(page_content=r.page_content, metadata=r.metadata)
             for r, score in results
-            if score>= self.vector_similarity_thresold
+            if score>= self.vector_similarity_threshold
         ]
 
     # ── Stage 1c: Knowledge graph  ──────────────────────────────────────────  ← new
@@ -234,7 +234,7 @@ class HybridRetriever:
             
             valid_docs = [
                 doc for doc, score in results 
-                if score >= self.graph_score_thresold
+                if score >= self.graph_score_threshold
             ]
             return valid_docs[:self.max_candidates_per_retriever]
             
@@ -307,15 +307,23 @@ def initialize_retriever() -> HybridRetriever:
         if not fname.startswith(".")
     ]
     print(f"Found {len(all_files)} files to check...")
+    with open("vector.txt", "w", encoding="utf-8") as f:
+        pass
 
     for fpath in tqdm(all_files, desc="Checking file status"):
         current_files.add(fpath)
         new_hash = get_file_hash(fpath)
+        
         if new_hash and file_hashes.get(fpath) != new_hash:
             print(f"\n  Change detected: {fpath}")
-            docs_to_add.extend(loader.load_document(fpath))
+            
+            # 2. Extract documents for just this file
+            new_docs = loader.load_document(fpath)
+            docs_to_add.extend(new_docs)
             updated_hashes[fpath] = new_hash
-    dump_chunks_to_file(docs_to_add, output_path="vector.txt")
+            
+            # 3. Dump these specific chunks in real-time (Append mode)
+            dump_chunks_to_file(new_docs, output_path="vector.txt", mode="a")
 
     # ── Handle deleted files ──────────────────
     deleted = set(file_hashes.keys()) - current_files
@@ -332,7 +340,6 @@ def initialize_retriever() -> HybridRetriever:
             del updated_hashes[fpath]
 
     # ── Qdrant vector store (Safely Isolated) ──
-    # qdrant_path = os.path.join(DB_LOCATION, "qdrant_data")
     
     # Using local Qdrant. Adjust url/api_key here if you use Qdrant Cloud/Docker.
     client = QdrantClient(url=QDRANT_URL)
@@ -347,7 +354,7 @@ def initialize_retriever() -> HybridRetriever:
             client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(
-                    size=size, # Ensure this matches your Ollama model dimensions (e.g., 768 for mxbai-embed-large)
+                    size=size, 
                     distance=Distance.COSINE
                 ),
             )
@@ -379,7 +386,9 @@ def initialize_retriever() -> HybridRetriever:
     # ── Add new documents ─────────────────────
     if docs_to_add:
         print(f"\nIndexing {len(docs_to_add)} new chunks...")
-
+        for doc in docs_to_add:
+            if "embed_content" in doc.metadata:
+                doc.page_content = doc.metadata["embed_content"]
         # 1. Filter out duplicates WITHIN the new docs_to_add list itself
         unique_docs_to_add = {}
         for d in docs_to_add:
@@ -391,14 +400,21 @@ def initialize_retriever() -> HybridRetriever:
         final_docs = list(unique_docs_to_add.values())
         final_ids = list(unique_docs_to_add.keys())
 
-        # Dense: batch-embed into Chroma
+        # Dense: batch-embed into Qdrant
         batch_size = 100
         for i in tqdm(range(0, len(final_docs), batch_size), desc="Embedding (dense)"):
             batch = final_docs[i : i + batch_size]
             batch_ids = final_ids[i : i + batch_size]
+            docs_to_embed = []
+            for doc in batch:
+                embed_doc = _Document(
+                    page_content=doc.metadata.get("embed_content", doc.page_content),
+                    metadata=doc.metadata
+                )
+                docs_to_embed.append(embed_doc)
             
             # Use upsert instead of add_documents to be safer
-            vector_store.add_documents(documents=batch, ids=batch_ids)
+            vector_store.add_documents(documents=docs_to_embed, ids=batch_ids)
 
         # Sparse: add new chunks to BM25 corpus (using the same unique list)
         added_count = 0
@@ -434,7 +450,7 @@ def initialize_retriever() -> HybridRetriever:
     print("\nHybrid retriever ready!")
     print(f"  Corpus        : {len(corpus)} chunks")
     print(f"  BM25 pool     : top {BM25_SCORE_RATIO}")
-    print(f"  Vector pool   : top {VECTOR_SIMILARITY_THRESOLD}")
+    print(f"  Vector pool   : top {VECTOR_SIMILARITY_THRESHOLD}")
     print(f"  Graph pool    : top {GRAPH_SCORE_THRESHOLD}")
     print(f"  Final top-k   : {FINAL_TOP_K} (after reranking)\n")
 
