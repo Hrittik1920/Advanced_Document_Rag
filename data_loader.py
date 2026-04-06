@@ -908,6 +908,91 @@ class MultiFormatDocumentLoader:
 
         metadata = {"source": os.path.basename(file_path), "file_type": "txt"}
         return self.splitter.split_plain_text(text_docs, metadata)
+    
+    def load_docx(self, file_path: str) -> list[Document]:
+        try:
+            docx = DocxDocument(file_path)
+        except Exception as e:
+            print(f"Error loading DOCX {file_path}: {e}")
+            return []
+
+        text_sections, table_sections = _extract_docx_sections(docx)
+        metadata = {"source": os.path.basename(file_path), "file_type": "docx"}
+        
+        # Process text and tables separately to protect the tables
+        docs = self.splitter.split_sections_with_context(text_sections, metadata, is_table=False)
+        docs.extend(self.splitter.split_sections_with_context(table_sections, metadata, is_table=True))
+        return docs
+
+    def load_csv(self, file_path: str, rows_per_chunk: int = 250) -> list[Document]:
+        """
+        CSVs have no heading structure; row-group chunking is the right
+        semantic boundary here — unchanged from original.
+        """
+        docs = []
+        try:
+            for i, df_chunk in enumerate(
+                pd.read_csv(file_path, on_bad_lines="skip", chunksize=rows_per_chunk, low_memory=True)
+            ):
+                buf = io.StringIO()
+                content=df_chunk.to_markdown(index=False)
+                if content:
+                    start = i * rows_per_chunk + 1
+                    docs.append(Document(
+                        page_content=content,
+                        metadata={
+                            "source": os.path.basename(file_path),
+                            "rows": f"{start}-{start + len(df_chunk) - 1}",
+                            "file_type": "csv_chunk",
+                        },
+                    ))
+        except Exception as e:
+            print(f"Error loading CSV {file_path}: {e}")
+        return docs
+
+    def load_excel(self, file_path: str, rows_per_chunk: int = 250) -> list[Document]:
+        """
+        Each sheet is treated as a named section; within a sheet,
+        further splitting uses the plain-text path if the sheet is large.
+        """
+        docs = []
+        try:
+            xls = pd.ExcelFile(file_path)
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(file_path, sheet_name=sheet_name)
+                
+                # Manually slice the dataframe into chunks
+                for start_row in range(0, len(df), rows_per_chunk):
+                    df_chunk = df.iloc[start_row : start_row + rows_per_chunk]
+                    content = df_chunk.to_markdown(index=False)
+                    
+                    if content:
+                        start_idx = start_row + 1
+                        end_idx = start_row + len(df_chunk)
+                        docs.append(Document(
+                            page_content=content,
+                            metadata={
+                                "source": os.path.basename(file_path),
+                                "sheet": sheet_name,
+                                "rows": f"{start_idx}-{end_idx}",
+                                "file_type": "excel_chunk",
+                                "is_table": True
+                            },
+                        ))
+        except Exception as e:
+            print(f"Error loading Excel {file_path}: {e}")
+        return docs
+
+    def load_txt(self, file_path: str) -> list[Document]:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:
+            print(f"Error loading TXT {file_path}: {e}")
+            return []
+
+        metadata = {"source": os.path.basename(file_path), "file_type": "txt"}
+        return self.splitter.split_plain_text(text, metadata)
 
     # ------------------------------------------------------------------
     # Dispatcher
