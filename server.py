@@ -1,3 +1,4 @@
+#sever.py
 import os
 import json
 import asyncio
@@ -200,15 +201,26 @@ async def run_llm_logic(sid, data: dict):
 
     if chat_history:
         standalone_question = await condense_chain.ainvoke({
-            "question": user_query,
+            "question": user_query,     
             settings.HISTORY_DIR: chat_history,
         })
+        if isinstance(standalone_question, str):
+            standalone_question = [standalone_question]   # safety net
     else:
-        standalone_question = user_query
+        standalone_question = [user_query] 
     log_debug(f"Standalone question: {standalone_question}")
     # 1. Retrieval
-    retrieved_docs = await retriever.ainvoke(standalone_question)
-    log_debug(f"Retrieved Docs Count: {len(retrieved_docs)}")
+    retrieval_tasks = [retriever.ainvoke(q) for q in standalone_question]
+    results = await asyncio.gather(*retrieval_tasks)
+    unique_docs_map = {}
+    for doc_list in results:
+        for doc in doc_list:
+            # Use page_content as the unique key (or doc.metadata['chunk_id'] if you have it)
+            if doc.page_content not in unique_docs_map:
+                unique_docs_map[doc.page_content] = doc
+                
+    retrieved_docs = list(unique_docs_map.values())
+    log_debug(f"Total Unique Retrieved Docs: {len(retrieved_docs)}")
     context, citation = format_documents(retrieved_docs)
     if not context:
         context = "No relevant documents found in the knowledge base."

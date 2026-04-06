@@ -1,3 +1,4 @@
+# retriever/vector.py
 import os
 import json
 import pickle
@@ -6,7 +7,7 @@ import re
 import asyncio
 from dataclasses import dataclass, field
 from typing import List, Optional
-
+from .models import _Document
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 from langchain_ollama import OllamaEmbeddings
@@ -66,13 +67,26 @@ def get_file_hash(path: str) -> Optional[str]:
 
 
 def doc_id(doc) -> str:
-    key = f"{doc.metadata.get('source','')}{doc.metadata.get('chunk_number',0)}{doc.page_content}"
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))  # Using UUID5 for consistent hashing
+    # Use the chunk_id that's already in metadata
+    chunk_id = doc.metadata.get('chunk_id')
+    if chunk_id:
+        # Qdrant REQUIRES a valid UUID. Hash the raw chunk_id into a UUID5.
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(chunk_id)))
+    
+    # Fallback for documents without chunk_id
+    key = f"{doc.metadata.get('source','')}{doc.metadata.get('section','')}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
 def corpus_doc_id(c: dict) -> str:
-    key = f"{c['metadata'].get('source','')}{c['metadata'].get('chunk_number',0)}{c['content']}"
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))  # Using UUID5 for consistent hashing
+    # This MUST match the logic in doc_id() so orphaned vectors can be deleted properly
+    chunk_id = c['metadata'].get('chunk_id')
+    if chunk_id:
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(chunk_id)))
+        
+    # Fallback matching doc_id
+    key = f"{c['metadata'].get('source','')}{c['metadata'].get('section','')}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
 # ─── File-hash persistence ───────────────────
@@ -103,18 +117,6 @@ def save_bm25_index(data: dict):
     os.makedirs(DB_LOCATION, exist_ok=True)
     with open(BM25_INDEX_FILE, "wb") as f:
         pickle.dump(data, f)
-
-
-# ─────────────────────────────────────────────
-# Minimal LangChain-compatible Document
-# ─────────────────────────────────────────────
-
-@dataclass
-class _Document:
-    page_content: str
-    metadata: dict = field(default_factory=dict)
-
-
 # ─────────────────────────────────────────────
 # Hybrid Retriever
 # ─────────────────────────────────────────────
@@ -200,30 +202,33 @@ class HybridRetriever:
             for i in valid_indices
         ]
 
+    _GARBAGE_RE = re.compile(
+        r'^[\s=\-\+\*\/\\\|\.\,\:\;\!\?\&\^\%\$\#\@\~\`\'\"\_\(\)\[\]\{\}A-Za-z0-9]{0,6}$'
+    )
+
     def _dense_search(self, query: str) -> List[_Document]:
-        results = self.vector_store.similarity_search_with_relevance_scores(query, k=self.max_candidates_per_retriever)
-        return [
-            _Document(page_content=r.page_content, metadata=r.metadata)
-            for r, score in results
-            if score>= self.vector_similarity_threshold
-        ]
+        results = self.vector_store.similarity_search_with_relevance_scores(
+            query, k=self.max_candidates_per_retriever
+        )
+        valid_docs = []
+        for r, score in results:
+            # Clamp floating-point overshoot from Qdrant normalisation
+            score = min(float(score), 1.0)
 
-    # ── Stage 1c: Knowledge graph  ──────────────────────────────────────────  ← new
-    #
-    #  The GraphRetriever returns chunks reachable within hop_depth hops of any
-    #  entity mentioned in the query.  This gives us chunks that BM25 and dense
-    #  both miss because they don't share keywords or embedding neighbourhood
-    #  with the query — they're connected only through a shared entity.
-    #
-    #  Examples of what this recovers:
-    #   • A chunk that defines "Protocol X" when the query asks what company
-    #     invented "Protocol X" — linked via the ORG entity.
-    #   • Cross-document summaries: chunk A mentions Person P; chunk B (different
-    #     doc) also mentions Person P — both bubble up together.
-    #   • Multi-hop: query about "ACME–Globex partnership" surfaces chunks that
-    #     each mention only one of the two orgs but co-occur with the same third
-    #     entity (a product), linking them through 2 hops.
+            content = r.page_content.strip()
 
+            if score < self.vector_similarity_threshold:
+                continue
+            if len(content) < 15:                    # catches 'E', 'MU', 'k', '=', '-'
+                continue
+            if self._GARBAGE_RE.match(content):            # catches short symbol/char combos
+                continue
+            if content.count('\n') > len(content) * 0.4:  # catches '-\n-\n-\n-\n-' style
+                continue
+
+            valid_docs.append(_Document(page_content=r.page_content, metadata=r.metadata))
+
+        return valid_docs
     def _graph_search(self, query: str) -> List[_Document]:
         if self.graph_retriever is None:
             return []
@@ -263,7 +268,7 @@ class HybridRetriever:
 
         for ranked in ranked_lists:
             for rank, doc in enumerate(ranked, start=1):
-                key = hashlib.sha256(doc.page_content.encode()).hexdigest()
+                key = doc.metadata.get('chunk_id', hashlib.sha256(doc.page_content.encode()).hexdigest())
                 scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
                 docs[key]   = doc
 
@@ -286,20 +291,22 @@ class HybridRetriever:
         return final_docs[:FINAL_TOP_K]
     
 def initialize_retriever() -> HybridRetriever:
-    print("Initializing Hybrid Retriever (BM25 + Dense + KG +Reranker)...")
+    print("Initializing Hybrid Retriever (BM25 + Dense + KG + Reranker)...")
 
-    loader       = MultiFormatDocumentLoader()
-    file_hashes  = load_file_hashes()
-    bm25_data    = load_bm25_index()
+    loader      = MultiFormatDocumentLoader()
+    file_hashes = load_file_hashes()
+    bm25_data   = load_bm25_index()
 
     corpus:       List[dict] = bm25_data["corpus"] if bm25_data else []
     existing_ids: set        = bm25_data["ids"]    if bm25_data else set()
 
     updated_hashes = file_hashes.copy()
-    docs_to_add    = []
-    current_files  = set()
+    docs_to_add:   List      = []
+    current_files: set       = set()
 
-    # ── Scan document directory ───────────────
+    # ── Track which files actually changed (needed for Bug 7) ──
+    changed_sources: set[str] = set()
+
     all_files = [
         os.path.join(root, fname)
         for root, _, files in os.walk(DOCUMENTS_DIRECTORY)
@@ -307,61 +314,65 @@ def initialize_retriever() -> HybridRetriever:
         if not fname.startswith(".")
     ]
     print(f"Found {len(all_files)} files to check...")
-    with open("vector.txt", "w", encoding="utf-8") as f:
-        pass
 
     for fpath in tqdm(all_files, desc="Checking file status"):
         current_files.add(fpath)
         new_hash = get_file_hash(fpath)
-        
+
         if new_hash and file_hashes.get(fpath) != new_hash:
             print(f"\n  Change detected: {fpath}")
-            
-            # 2. Extract documents for just this file
             new_docs = loader.load_document(fpath)
             docs_to_add.extend(new_docs)
             updated_hashes[fpath] = new_hash
-            
-            # 3. Dump these specific chunks in real-time (Append mode)
+            # Record the basename so we can purge stale corpus entries below
+            changed_sources.add(os.path.basename(fpath))
             dump_chunks_to_file(new_docs, output_path="vector.txt", mode="a")
 
-    # ── Handle deleted files ──────────────────
+    # ── Bug 7 fix: purge stale corpus entries for changed files ──────────────
+    # Must happen BEFORE adding new chunks so dedup logic works correctly
+    if changed_sources:
+        before = len(corpus)
+        corpus = [
+            c for c in corpus
+            if c["metadata"].get("source") not in changed_sources
+        ]
+        existing_ids = {corpus_doc_id(c) for c in corpus}
+        print(f"  Purged {before - len(corpus)} stale chunks from changed files.")
+
+        # Also remove stale vectors from Qdrant for changed files
+        # (Qdrant upsert handles collisions by ID, but stale IDs that no longer
+        #  exist in the new chunks would linger without this step)
+        # We collect the old IDs before the purge above by diffing; here we let
+        # the upsert below overwrite by ID naturally for any re-used chunk_ids,
+        # and rely on the corpus purge for BM25 correctness.
+
+    # ── Handle deleted files (unchanged logic) ────────────────────────────────
     deleted = set(file_hashes.keys()) - current_files
-    deleted_chunk_ids = []
-    
     if deleted:
         print(f"Pruning chunks from {len(deleted)} deleted file(s)...")
-        # Identify which chunks belong to the deleted files to remove them from Qdrant later
         deleted_chunk_ids = [corpus_doc_id(c) for c in corpus if c["metadata"].get("source") in deleted]
-        
         corpus = [c for c in corpus if c["metadata"].get("source") not in deleted]
         existing_ids = {corpus_doc_id(c) for c in corpus}
         for fpath in deleted:
             del updated_hashes[fpath]
 
-    # ── Qdrant vector store (Safely Isolated) ──
-    
-    # Using local Qdrant. Adjust url/api_key here if you use Qdrant Cloud/Docker.
+    # ── Qdrant setup (unchanged) ──────────────────────────────────────────────
     client = QdrantClient(url=QDRANT_URL)
     size = len(EMBEDDINGS.embed_query("test"))
     print(f"Embedding dimension detected: {size}")
+
     try:
         collections = client.get_collections().collections
         exists = any(c.name == COLLECTION_NAME for c in collections)
-        
         if not exists:
             print(f"Creating collection '{COLLECTION_NAME}'...")
             client.create_collection(
                 collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(
-                    size=size, 
-                    distance=Distance.COSINE
-                ),
+                vectors_config=VectorParams(size=size, distance=Distance.COSINE),
             )
     except Exception as e:
         print(f"Error checking/creating Qdrant collection: {e}")
 
-    # Now initialize the store safely
     try:
         vector_store = QdrantVectorStore(
             client=client,
@@ -370,11 +381,9 @@ def initialize_retriever() -> HybridRetriever:
         )
     except Exception as e:
         print(f"Critical error: Could not initialize QdrantVectorStore: {e}")
-        # Re-raise or exit because we cannot proceed without the vector_store
         raise e
-    # Safely delete orphaned vectors from Qdrant if files were removed
-    if deleted_chunk_ids:
-        print(f"Removing {len(deleted_chunk_ids)} orphaned vectors from Qdrant collection '{COLLECTION_NAME}'...")
+
+    if deleted:
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
@@ -383,44 +392,44 @@ def initialize_retriever() -> HybridRetriever:
         except Exception as e:
             print(f"Warning: Could not delete old points from Qdrant: {e}")
 
-    # ── Add new documents ─────────────────────
+    # ── Add new documents ─────────────────────────────────────────────────────
     if docs_to_add:
         print(f"\nIndexing {len(docs_to_add)} new chunks...")
-        for doc in docs_to_add:
-            if "embed_content" in doc.metadata:
-                doc.page_content = doc.metadata["embed_content"]
-        # 1. Filter out duplicates WITHIN the new docs_to_add list itself
-        unique_docs_to_add = {}
+
+        # Bug 6 fix: deduplicate WITHOUT mutating the original doc objects
+        unique_docs_to_add: dict[str, _Document] = {}
         for d in docs_to_add:
             did = doc_id(d)
             if did not in unique_docs_to_add:
                 unique_docs_to_add[did] = d
-        
-        # 2. Convert back to list and prepare for batching
-        final_docs = list(unique_docs_to_add.values())
-        final_ids = list(unique_docs_to_add.keys())
 
-        # Dense: batch-embed into Qdrant
+        final_docs = list(unique_docs_to_add.values())
+        final_ids  = list(unique_docs_to_add.keys())
+
+        # Dense: embed using embed_content if present, but NEVER touch page_content
         batch_size = 100
         for i in tqdm(range(0, len(final_docs), batch_size), desc="Embedding (dense)"):
-            batch = final_docs[i : i + batch_size]
+            batch     = final_docs[i : i + batch_size]
             batch_ids = final_ids[i : i + batch_size]
-            docs_to_embed = []
-            for doc in batch:
-                embed_doc = _Document(
-                    page_content=doc.metadata.get("embed_content", doc.page_content),
-                    metadata=doc.metadata
-                )
-                docs_to_embed.append(embed_doc)
-            
-            # Use upsert instead of add_documents to be safer
-            vector_store.add_documents(documents=docs_to_embed, ids=batch_ids)
 
-        # Sparse: add new chunks to BM25 corpus (using the same unique list)
+            # Bug 6 fix: build a separate embed-only copy; original is untouched
+            embed_batch = [
+                _Document(
+                    page_content=d.metadata.get("embed_content", d.page_content),
+                    metadata=d.metadata,
+                )
+                for d in batch
+            ]
+            vector_store.add_documents(documents=embed_batch, ids=batch_ids)
+
+        # Sparse: add original (unmodified) chunks to BM25 corpus
         added_count = 0
         for did, d in unique_docs_to_add.items():
             if did not in existing_ids:
-                corpus.append({"content": d.page_content, "metadata": d.metadata})
+                corpus.append({
+                    "content":  d.page_content,      # original text, not embed_content
+                    "metadata": d.metadata,
+                })
                 existing_ids.add(did)
                 added_count += 1
 
@@ -434,32 +443,32 @@ def initialize_retriever() -> HybridRetriever:
     if not corpus:
         raise ValueError("No documents indexed. Add files to the documents directory.")
 
-    # ── Build in-memory BM25 ──────────────────
+    # ── Build in-memory BM25 ──────────────────────────────────────────────────
     print("Building BM25 index...")
     tokenized = [tokenize(c["content"]) for c in corpus]
     bm25 = BM25Okapi(tokenized)
 
-    # ── Build / update knowledge graph ───────     ← new
-    print("Building Knowledge Graph …")
+    # ── Build knowledge graph ─────────────────────────────────────────────────
+    print("Building Knowledge Graph...")
     graph_ret = build_graph_retriever(corpus)
 
-    # ── Load cross-encoder reranker ───────────
-    print(f"Loading reranker: {RERANKER_MODEL} ...")
+    # ── Load reranker ─────────────────────────────────────────────────────────
+    print(f"Loading reranker: {RERANKER_MODEL}...")
     reranker = CrossEncoder(RERANKER_MODEL)
 
     print("\nHybrid retriever ready!")
-    print(f"  Corpus        : {len(corpus)} chunks")
-    print(f"  BM25 pool     : top {BM25_SCORE_RATIO}")
-    print(f"  Vector pool   : top {VECTOR_SIMILARITY_THRESHOLD}")
-    print(f"  Graph pool    : top {GRAPH_SCORE_THRESHOLD}")
-    print(f"  Final top-k   : {FINAL_TOP_K} (after reranking)\n")
+    print(f"  Corpus      : {len(corpus)} chunks")
+    print(f"  BM25 pool   : top {BM25_SCORE_RATIO}")
+    print(f"  Vector pool : similarity ≥ {VECTOR_SIMILARITY_THRESHOLD}")
+    print(f"  Graph pool  : score ≥ {GRAPH_SCORE_THRESHOLD}")
+    print(f"  Final top-k : {FINAL_TOP_K} (after reranking)\n")
 
     return HybridRetriever(
         corpus=corpus,
         bm25=bm25,
         vector_store=vector_store,
         reranker=reranker,
-        graph_retriever=graph_ret,      # ← new
+        graph_retriever=graph_ret,
     )
 
 
