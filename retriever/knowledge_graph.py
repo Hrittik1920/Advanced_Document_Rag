@@ -1,5 +1,5 @@
 """
-knowledge_graph.py
+retriever/knowledge_graph.py
 ──────────────────
 Builds an entity–relation graph over your document corpus and exposes a
 LangChain-compatible retriever that returns chunks reachable from entities
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 import spacy
-
+from .models import _Document
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,7 +354,6 @@ class GraphRetriever:
         """
         Returns _Document-like objects along with their graph proximity score.
         """
-        from retriever import _Document  # local import to keep this file standalone
 
         if self.G.number_of_nodes() == 0:
             return []

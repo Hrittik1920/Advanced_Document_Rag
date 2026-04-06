@@ -1,8 +1,8 @@
-# script.py (Corrected, Stateless Version)
+# script.py 
 import os
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from config import settings
 from llm_clients import query_ollama
@@ -13,19 +13,23 @@ MAX_CONTEXT_CHARS = 30_000
 HISTORY_KEY = settings.HISTORY_DIR
 # --- Model ---
 model =OllamaLLM(model=MODEL_NAME, streaming=True)
-# --- Condense Prompt (rewrites follow-up questions to be standalone) ---
+# --- Condense Prompt (rewrites follow-up questions to be ) ---
 condense_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Given the chat history and the latest user question, rewrite the question "
-        "as a fully self-contained, standalone question. "
-        "Do NOT answer it. Only rewrite it. If it's already standalone, return it as-is."
+        "Given the chat history and the latest user question, your task is to rewrite the question "
+        "as fully self-contained, standalone questions. \n"
+        "If the user asks about multiple distinct entities or concepts (e.g., comparing three different companies), "
+        "break the question down into a list of separate, specific questions.\n"
+        "If the question is simple, just return a list with one rewritten question.\n"
+        "You MUST return ONLY a valid JSON array of strings. Do not include markdown formatting or explanations.\n"
+        "Example: [\"What is the commercial tariff for company A?\", \"What is the commercial tariff for company B?\"]"
     ),
     MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
     ("human", "{question}"),
 ])
 
-condense_chain = condense_prompt | model | StrOutputParser()
+condense_chain = condense_prompt | model | JsonOutputParser()
 
 # --- Prompt Template ---
 
@@ -37,7 +41,7 @@ prompt = ChatPromptTemplate.from_messages([
         "You are an AI assistant. Your task is to answer user questions based *only* on the provided context.\n"
         "CRITICAL INSTRUCTION: When you use information from the context to form your answer, you MUST cite the exact source index inline using brackets (e.g., [1], [3]).\n\n"
         "Structure your entire response using the following Markdown format:\n\n"
-        "### Suraksha's Reply\n"
+        "### Billpro Bot\n"
          "[Your concise, conversational answer to the user's question goes here. Include inline citations like [1] where applicable.]\n\n"
          "---\n\n"
         "### Key Takeaways\n"
