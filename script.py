@@ -18,12 +18,16 @@ condense_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
         "Given the chat history and the latest user question, your task is to rewrite the question "
-        "as fully self-contained, standalone questions. \n"
-        "If the user asks about multiple distinct entities or concepts (e.g., comparing three different companies), "
-        "break the question down into a list of separate, specific questions.\n"
-        "If the question is simple, just return a list with one rewritten question.\n"
-        "You MUST return ONLY a valid JSON array of strings. Do not include markdown formatting or explanations.\n"
-        "Example: [\"What is the commercial tariff for company A?\", \"What is the commercial tariff for company B?\"]"
+        "as fully self-contained, standalone questions.\n"
+        "If the user asks about multiple distinct entities or concepts, break the question down into a list of separate questions.\n"
+        "You MUST return ONLY a valid JSON object with two keys:\n"
+        "1. 'retrieval_queries': A list of strings to be used for database search.\n"
+        "2. 'generation_question': A single, comprehensive string combining the intent of the rewritten questions. This will be used by the final answering model and saved to the chat history.\n"
+        "Example:\n"
+        "{{\n" 
+        "  \"retrieval_queries\": [\"What is the commercial tariff for company A?\", \"What is the commercial tariff for company B?\"],\n"
+        "  \"generation_question\": \"What are the commercial tariffs for company A and company B?\"\n"
+        "}}"
     ),
     MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
     ("human", "{question}"),

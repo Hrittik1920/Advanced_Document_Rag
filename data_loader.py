@@ -648,7 +648,6 @@ def _extract_pdf_sections(text: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Main loader class
 # ---------------------------------------------------------------------------
-con
 class MultiFormatDocumentLoader:
     """
     Load and process various document formats using header/topic-aware chunking.
