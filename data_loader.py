@@ -648,7 +648,6 @@ def _extract_pdf_sections(text: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Main loader class
 # ---------------------------------------------------------------------------
-
 class MultiFormatDocumentLoader:
     """
     Load and process various document formats using header/topic-aware chunking.
@@ -906,8 +905,10 @@ class MultiFormatDocumentLoader:
                 print(f"Error loading TXT {file_path}: {e}")
                 return []
 
-        metadata = {"source": os.path.basename(file_path), "file_type": "txt"}
-        return self.splitter.split_plain_text(text_docs, metadata)
+        final_docs =table_docs + text_docs
+        if not final_docs and total_text.strip():
+            return self.splitter.split_plain_text(total_text, base_metadata)
+        return final_docs
     
     def load_docx(self, file_path: str) -> list[Document]:
         try:

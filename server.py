@@ -200,15 +200,24 @@ async def run_llm_logic(sid, data: dict):
     chat_history = history_obj.messages
 
     if chat_history:
-        standalone_question = await condense_chain.ainvoke({
+        condensed_result = await condense_chain.ainvoke({
             "question": user_query,     
             settings.HISTORY_DIR: chat_history,
         })
-        if isinstance(standalone_question, str):
-            standalone_question = [standalone_question]   # safety net
+        if isinstance(condensed_result, dict):
+            standalone_question = condensed_result.get("retrieval_queries", [user_query])   # safety net
+            generation_question = condensed_result.get("generation_question", user_query)
+        elif isinstance(condensed_result, list):
+            standalone_question = condensed_result
+            generation_question = " and " .join(condensed_result)
+        else:
+            standalone_questions = [user_query]
+            generation_question = user_query
     else:
         standalone_question = [user_query] 
+        generation_question = user_query
     log_debug(f"Standalone question: {standalone_question}")
+    log_debug(f"Generation question: {generation_question}")
     # 1. Retrieval
     retrieval_tasks = [retriever.ainvoke(q) for q in standalone_question]
     results = await asyncio.gather(*retrieval_tasks)
@@ -238,7 +247,7 @@ async def run_llm_logic(sid, data: dict):
         {context[:800]}
 
         Question:
-        {user_query}
+        {generation_question}
         ---------------------
         """
     log_debug(final_prompt_preview)
@@ -248,7 +257,7 @@ async def run_llm_logic(sid, data: dict):
     
     try:
         async for chunk in chain_with_history.astream(
-            {"context": context, "question": user_query},
+            {"context": context, "question": generation_question},
             config={"configurable": {"session_id": sid}}
         ):
             chunk_text = chunk if isinstance(chunk, str) else chunk.content

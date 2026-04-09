@@ -16,6 +16,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from tqdm import tqdm
 import uuid
+import concurrent.futures
 
 from data_loader import MultiFormatDocumentLoader, dump_chunks_to_file
 from config import settings
@@ -36,7 +37,7 @@ EMBEDDINGS      = OllamaEmbeddings(model=settings.LLM_EMBEDDING_MODEL)
 RERANKER_MODEL  = settings.CROSS_ENCODER_MODEL
 
 # Stage 1 — how many candidates each retriever returns before fusion on the basis of thresholds
-BM25_SCORE_RATIO   = 0.4
+BM25_SCORE_RATIO   = 0.7
 VECTOR_SIMILARITY_THRESHOLD = 0.6
 GRAPH_SCORE_THRESHOLD  = 0.4      # ← new
 # Stage 3 — final docs after reranking
@@ -158,9 +159,31 @@ class HybridRetriever:
     # ── Internal pipeline ────────────────────────
 
     def _retrieve(self, query: str) -> List[_Document]:
-        bm25_results   = self._bm25_search(query)
-        dense_results  = self._dense_search(query)
-        graph_results  = self._graph_search(query)          # ← new
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            bm25_future = executor.submit(self._bm25_search, query)
+            dense_future = executor.submit(self._dense_search, query)
+            graph_future = executor.submit(self._graph_search, query)
+
+            bm25_results = bm25_future.result()
+            dense_results = dense_future.result()
+            graph_results = graph_future.result()
+            try:
+                bm25_results = bm25_future.result()
+            except Exception as e:
+                print(f"[BM25] warning: {e}")
+                bm25_results = []
+
+            try:
+                dense_results = dense_future.result()
+            except Exception as e:
+                print(f"[Dense] warning: {e}")
+                dense_results = []
+
+            try:
+                graph_results = graph_future.result()
+            except Exception as e:
+                print(f"[Graph] warning: {e}")
+                graph_results = []
 
         # 3-way RRF
         fused = self._reciprocal_rank_fusion(bm25_results, dense_results, graph_results)
