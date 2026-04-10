@@ -57,7 +57,8 @@ def _chunk_id(source: str, chunk_number: int, content: str) -> str:
 
 def _normalise(text: str) -> str:
     """Lower-case, strip punctuation → canonical entity name."""
-    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+    text = re.sub(r"[^a-z0-9 ]", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +268,7 @@ class KnowledgeGraphBuilder:
                 if ent.label_ not in RELEVANT_LABELS:
                     continue
                 norm = _normalise(ent.text)
-                if not norm or norm in seen:
+                if not norm or norm in seen or norm.isnumeric() or len(norm.split()) > 6: #skip purely numeric or very long entities
                     continue
                 seen.add(norm)
                 results.append((ent.text, ent.label_))

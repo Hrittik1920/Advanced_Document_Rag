@@ -22,6 +22,7 @@ from data_loader import MultiFormatDocumentLoader, dump_chunks_to_file
 from config import settings
 from .knowledge_graph import build_graph_retriever, GraphRetriever   # ← new
 
+
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
@@ -39,10 +40,10 @@ RERANKER_MODEL  = settings.CROSS_ENCODER_MODEL
 # Stage 1 — how many candidates each retriever returns before fusion on the basis of thresholds
 BM25_SCORE_RATIO   = 0.7
 VECTOR_SIMILARITY_THRESHOLD = 0.6
-GRAPH_SCORE_THRESHOLD  = 0.4      # ← new
+GRAPH_SCORE_THRESHOLD  = 0.3      # ← new
 # Stage 3 — final docs after reranking
 MAX_CANDIDATES_PER_RETRIEVER = 100
-RERANKER_THRESHOLD=0.1
+DYNAMIC_DROP_OFF = 6.0 # drop anything that is this many points lower than the best doc's score
 FINAL_TOP_K = 30
 
 
@@ -163,10 +164,6 @@ class HybridRetriever:
             bm25_future = executor.submit(self._bm25_search, query)
             dense_future = executor.submit(self._dense_search, query)
             graph_future = executor.submit(self._graph_search, query)
-
-            bm25_results = bm25_future.result()
-            dense_results = dense_future.result()
-            graph_results = graph_future.result()
             try:
                 bm25_results = bm25_future.result()
             except Exception as e:
@@ -307,8 +304,12 @@ class HybridRetriever:
         
         # Filter purely by cross-encoder threshold
         ranked = sorted(zip(r_scores, candidates), key=lambda x: x[0], reverse=True)
+        if not ranked:
+            return []
         
-        final_docs = [doc for score, doc in ranked if score >= RERANKER_THRESHOLD]
+        best_doc_score = ranked[0][0]
+        # Dynamic drop-off: keep anything within a certain score range of the best doc, rather than a hard cutoff
+        final_docs = [doc for score, doc in ranked if score >= (best_doc_score - DYNAMIC_DROP_OFF)]
         
         # Optional: Apply absolute cap to avoid flooding the LLM context window
         return final_docs[:FINAL_TOP_K]
