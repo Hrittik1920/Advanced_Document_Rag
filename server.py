@@ -18,6 +18,8 @@ from datetime import datetime
 import warnings
 import sys
 import io
+import tempfile
+from data_loader import MultiFormatDocumentLoader
 warnings.filterwarnings("ignore", category=FutureWarning)
 from script import format_documents, original_chain, condense_chain
 
@@ -192,8 +194,62 @@ async def handle_chat_request(sid, data: dict):
         
 async def run_llm_logic(sid, data: dict):
     """Actual RAG and LLM logic extracted from the main handler."""
-    user_query = data.get("message")
+    user_query = data.get("message", "")
     log_debug(f"Received query: {user_query}")
+
+    # --- Process Uploaded File ---
+    uploaded_doc_text = ""
+    file_info = data.get("file")
+    tmp_path = None
+    
+    if file_info:
+        file_name = file_info.get("name", "uploaded_document")
+        file_bytes = file_info.get("data") # Received as bytes from SocketIO ArrayBuffer
+        log_debug(f"File received: {file_name}")
+        
+        # 1. Safely create the temporary file path
+        suffix = os.path.splitext(file_name)[1]
+        
+        # 2. Open, write, and CLOSE the file using a context manager
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            tmp.flush() # Force write to disk
+            tmp_path = tmp.name 
+        # The file is now closed and accessible to other processes/threads.
+
+        try:
+            # 3. Process the fully saved file
+            def process_uploaded_file():
+                # --- Create and set a new event loop for this background thread ---
+                thread_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(thread_loop)
+                
+                try:
+                    loader = MultiFormatDocumentLoader()
+                    return loader.load_document(tmp_path)
+                finally:
+                    # Always clean up the loop when done
+                    thread_loop.close()
+                
+            docs = await asyncio.to_thread(process_uploaded_file)
+            uploaded_doc_text = "\n\n".join([d.page_content for d in docs])
+            
+            log_debug(f"Extracted {len(uploaded_doc_text)} chars from uploaded document.")
+            print(f"DEBUG EXTRACTED TEXT: {uploaded_doc_text[:200]}...") # Print first 200 chars for terminal debugging
+            
+        except Exception as e:
+            log_debug(f"Error extracting text from uploaded file: {e}")
+            print(f"Error extracting text: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # 4. Clean up the file after processing
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception as cleanup_error:
+                    log_debug(f"Could not remove temp file: {cleanup_error}")
+    # ----------------------------------
     
     # 0. Get history and condense the question
     history_obj = get_session_history(sid)
@@ -211,34 +267,45 @@ async def run_llm_logic(sid, data: dict):
             standalone_question = condensed_result
             generation_question = " and " .join(condensed_result)
         else:
-            standalone_questions = [user_query]
+            standalone_question = [user_query]
             generation_question = user_query
     else:
         standalone_question = [user_query] 
         generation_question = user_query
+        
     log_debug(f"Standalone question: {standalone_question}")
     log_debug(f"Generation question: {generation_question}")
+    
     # 1. Retrieval
-    retrieval_tasks = [retriever.ainvoke(q) for q in standalone_question]
+    # --- NEW: Extract target files for filtering ---
+    target_files = data.get("target_files", [])
+    if target_files:
+        log_debug(f"Targeting specific files: {target_files}")
+    
+    # 1. Retrieval (UPDATE THIS LINE)
+    retrieval_tasks = [retriever.ainvoke(q, target_sources=target_files) for q in standalone_question]
     results = await asyncio.gather(*retrieval_tasks)
     unique_docs_map = {}
     for doc_list in results:
         for doc in doc_list:
-            # Use page_content as the unique key (or doc.metadata['chunk_id'] if you have it)
             if doc.page_content not in unique_docs_map:
                 unique_docs_map[doc.page_content] = doc
                 
     retrieved_docs = list(unique_docs_map.values())
     log_debug(f"Total Unique Retrieved Docs: {len(retrieved_docs)}")
     context, citation = format_documents(retrieved_docs)
+    
     if not context:
         context = "No relevant documents found in the knowledge base."
         citation=[]
+        
     preview_context = context[:500] + "..." if len(context) > 500 else context
     with open("chunk.txt", "w", encoding="utf-8") as f:
         f.write(context)
+        
     log_debug(f"Context Preview: {preview_context}")
     log_debug(f"Context Length: {len(context)} chars")
+    
     # 2. Streaming Response
     full_response = ""
     final_prompt_preview = f"""
@@ -251,13 +318,26 @@ async def run_llm_logic(sid, data: dict):
         ---------------------
         """
     log_debug(final_prompt_preview)
+
+    # Always print the question
+    print(f"Question: {generation_question}")
     
+    # If there is extracted text, save it to a file
+    if uploaded_doc_text:
+        with open("upload_content.txt", "w", encoding="utf-8") as f:
+            f.write(uploaded_doc_text)
+        print("📁 Saved extracted document text to upload_content.txt")
+
     # Initialize final_citations to empty list BEFORE try block
     final_citations = []
     
     try:
         async for chunk in chain_with_history.astream(
-            {"context": context, "question": generation_question},
+            {
+                "context": context, 
+                "question": generation_question,
+                "uploaded_doc_text": uploaded_doc_text  
+            },
             config={"configurable": {"session_id": sid}}
         ):
             chunk_text = chunk if isinstance(chunk, str) else chunk.content
@@ -380,6 +460,16 @@ async def get_document_page(source: str, page: int = 0):
         raise HTTPException(status_code=415, detail=f"Unsupported file type: {ext}")
 
     return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+
+@app.get("/v1/available-files")
+async def get_available_files():
+    """Returns a list of all available documents for the frontend mention feature."""
+    files = []
+    if os.path.exists(settings.DOCUMENTS_DIR):
+        for f in os.listdir(settings.DOCUMENTS_DIR):
+            if os.path.isfile(os.path.join(settings.DOCUMENTS_DIR, f)) and not f.startswith("."):
+                files.append(f)
+    return {"files": files}
 
 
 if __name__ == "__main__":

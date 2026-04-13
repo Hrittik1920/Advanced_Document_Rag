@@ -39,6 +39,7 @@ condense_chain = condense_prompt | model | JsonOutputParser()
 
 # script.py
 
+# --- Prompt Template ---
 prompt = ChatPromptTemplate.from_messages([
     (
         "system",
@@ -70,6 +71,12 @@ prompt = ChatPromptTemplate.from_messages([
         "- **Partial Answers over No Answers**: ONLY say 'I could not find relevant information in the documents for that question.' if the context contains absolutely NO units, tables, or signals related to the query. If you only find partial information (e.g., you find MSEDCL but not UPPCL), provide what you found and state clearly what is missing.\n"
         "- **Greetings**: For simple greetings (e.g., 'Hi', 'Hello'), provide only the '### Billpro Bot' section with a friendly greeting, omitting the 'Key Takeaways' and separator.\n\n"
         
+        # --- NEW SECTION FOR UPLOADED DOC ---
+        "### 📄 UPLOADED DOCUMENT FOR VALIDATION:\n"
+        "The user may have uploaded a specific document to be validated or queried against the system's core CONTEXT.\n"
+        "{uploaded_doc_text}\n\n"
+        # ------------------------------------
+
         "CONTEXT:\n---\n{context}\n---"
     ),
     MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
@@ -128,6 +135,7 @@ original_chain = (
     {
         "context": lambda x: x["context"],
         "question": lambda x: x["question"],
+        "uploaded_doc_text": lambda x: x.get("uploaded_doc_text", ""), # <-- Map the new variable
         HISTORY_KEY: lambda x: x[HISTORY_KEY]
     }
     | prompt

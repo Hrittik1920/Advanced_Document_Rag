@@ -112,7 +112,7 @@
         .citation-link:hover { color: #00796b; text-decoration: underline solid; }
 
         /* Input Area */
-        .chat-input-area { padding: 20px 28px; background-color: var(--chat-container-bg); border-top: 1px solid var(--border-color); }
+        .chat-input-area { position: relative; padding: 20px 28px; background-color: var(--chat-container-bg); border-top: 1px solid var(--border-color); }
         #chat-form { display: flex; gap: 14px; align-items: center; }
         #user-input { flex: 1; padding: 12px 24px; border: 1px solid var(--border-color); background-color: var(--input-bg); border-radius: 24px; font-size: 1rem; outline: none; transition: height 0.2s ease-in-out, background-color var(--transition-speed); resize: none; overflow-y: hidden; font-family: inherit; line-height: 1.5; max-height: 150px; display: block; }
         #user-input:focus { background-color: #fff; border-color: var(--header-bg); box-shadow: 0 0 0 4px var(--accent-soft); }
@@ -152,6 +152,77 @@
         .doc-modal-loading { color: #6b7280; font-size: 1rem; margin: auto; font-weight: 500;}
         .doc-modal-img { width: 100%; max-width: 800px; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
         .doc-modal-error { color: #ef4444; font-size: 1rem; margin: auto; }
+        /* Mention Dropdown Styles */
+        /* Improved Dropdown Styling */
+        .mention-dropdown {
+            position: absolute;
+            bottom: 100%;
+            left: 28px;
+            background: #ffffff;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+            max-height: 220px;
+            width: 320px;
+            overflow-y: auto;
+            z-index: 100;
+            display: none;
+            margin-bottom: 8px;
+            padding: 8px 0;
+            scrollbar-width: thin;
+        }
+        .mention-dropdown::-webkit-scrollbar { width: 6px; }
+        .mention-dropdown::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 10px; }
+        
+        .mention-item {
+            padding: 10px 16px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            color: #333;
+            transition: all 0.15s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .mention-item::before { content: '📄'; font-size: 1rem; opacity: 0.7; }
+        .mention-item:hover, .mention-item.active { background-color: var(--accent-soft); color: var(--header-bg); font-weight: 600; }
+        .mention-matched-text { font-weight: 800; color: var(--header-bg); text-decoration: underline; text-decoration-color: var(--accent-soft); text-decoration-thickness: 2px;}
+
+        /* Visual Tag Pills */
+        .selected-tags-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px;
+            display: none; /* Block when not empty */
+        }
+        .mention-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: var(--accent-soft);
+            color: var(--header-bg);
+            border: 1px solid rgba(0, 150, 136, 0.2);
+            padding: 5px 12px;
+            border-radius: 16px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+            animation: popIn 0.2s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+        }
+        @keyframes popIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .mention-pill-close {
+            background: none;
+            border: none;
+            color: var(--header-bg);
+            font-size: 1.2rem;
+            line-height: 0.8;
+            padding: 0;
+            cursor: pointer;
+            opacity: 0.6;
+            transition: all 0.2s;
+        }
+        .mention-pill-close:hover { opacity: 1; color: #dc3545; transform: scale(1.1); }
     </style>
 </head>
 <body>
@@ -166,7 +237,22 @@
         <main class="chat-box" id="chat-box"></main>
         
         <footer class="chat-input-area">
+            <div id="mention-dropdown" class="mention-dropdown"></div>
+            <div id="file-indicator" style="display: none; padding: 8px 14px; background: var(--accent-soft); border-radius: 8px; font-size: 0.85rem; margin-bottom: 12px; color: var(--header-bg); font-weight: 600; width: fit-content; align-items: center; gap: 10px;">
+                <span id="file-name-display"></span>
+                <button type="button" id="remove-file-btn" style="background: none; border: none; cursor: pointer; color: #dc3545; font-size: 1.2rem; line-height: 1; padding: 0;">&times;</button>
+            </div>
+
+            <div id="selected-tags-container" class="selected-tags-container"></div>
+
             <form id="chat-form">
+                <label for="file-upload" class="attach-btn" style="cursor: pointer; padding: 10px; color: #747775; display: flex; align-items: center; transition: color 0.2s;">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" style="width:24px; height:24px;">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm5 11h-4v4h-2v-4H7v-2h4V7h2v4h4v2z"/>
+                    </svg>
+                </label>
+                <input type="file" id="file-upload" style="display:none;" />
+                
                 <textarea id="user-input" placeholder="Ask me anything..." autocomplete="off" rows="1"></textarea>
                 <button type="submit" id="send-button" class="send-button">
                     <svg id="send-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" style="width:20px; height:20px;">
@@ -203,6 +289,118 @@
 
             let isRequestInProgress = false;
             let currentBotMessageElement = null;
+
+            
+            // --- NEW: FILE UPLOAD VARIABLES & LOGIC ---
+            const fileInput = document.getElementById("file-upload");
+            const fileIndicator = document.getElementById("file-indicator");
+            const fileNameDisplay = document.getElementById("file-name-display");
+            const removeFileBtn = document.getElementById("remove-file-btn");
+            let attachedFile = null;
+            
+            // --- NEW & IMPROVED: Mention Feature Logic ---
+            let availableFiles = [];
+            let selectedMentions = []; // Array to store actual selected files
+            let mentionActive = false;
+            let mentionQuery = "";
+            let mentionStartIndex = -1;
+            
+            const mentionDropdown = document.getElementById("mention-dropdown");
+            const selectedTagsContainer = document.getElementById("selected-tags-container");
+            let selectedMentionIndex = 0;
+
+            fetch('/v1/available-files')
+                .then(res => res.json())
+                .then(data => { availableFiles = data.files || []; })
+                .catch(err => console.error("Could not load files:", err));
+
+            // Renders the visual pills above the text box
+            function renderSelectedTags() {
+                selectedTagsContainer.innerHTML = "";
+                if (selectedMentions.length === 0) {
+                    selectedTagsContainer.style.display = "none";
+                    return;
+                }
+                
+                selectedMentions.forEach((fileName, index) => {
+                    const pill = document.createElement("div");
+                    pill.className = "mention-pill";
+                    pill.innerHTML = `<span>@${fileName}</span><button type="button" class="mention-pill-close" data-index="${index}">&times;</button>`;
+                    selectedTagsContainer.appendChild(pill);
+                });
+                
+                selectedTagsContainer.style.display = "flex";
+
+                // Add listeners to the "x" buttons
+                selectedTagsContainer.querySelectorAll(".mention-pill-close").forEach(btn => {
+                    btn.addEventListener("click", (e) => {
+                        const idx = parseInt(e.target.getAttribute("data-index"));
+                        selectedMentions.splice(idx, 1);
+                        renderSelectedTags();
+                        userInput.focus();
+                    });
+                });
+            }
+
+            function insertMention(fileName) {
+                // Add to our array if not already there
+                if (!selectedMentions.includes(fileName)) {
+                    selectedMentions.push(fileName);
+                }
+                
+                // Remove the typed '@query' from the text area completely
+                const text = userInput.value;
+                const beforeMention = text.substring(0, mentionStartIndex);
+                const afterMention = text.substring(userInput.selectionStart);
+                userInput.value = beforeMention + afterMention.trimStart(); 
+                
+                mentionActive = false;
+                mentionDropdown.style.display = "none";
+                
+                renderSelectedTags();
+                userInput.focus();
+            }
+
+            function renderMentionDropdown(files, query) {
+                if (files.length === 0) {
+                    mentionDropdown.style.display = "none";
+                    return;
+                }
+                mentionDropdown.innerHTML = "";
+                files.forEach((file, index) => {
+                    const item = document.createElement("div");
+                    item.className = `mention-item ${index === selectedMentionIndex ? 'active' : ''}`;
+                    item.textContent = file;
+                    
+                    item.addEventListener("mousedown", (e) => {
+                        e.preventDefault();
+                        insertMention(file);
+                    });
+                    
+                    if (query && file.toLowerCase().includes(query.toLowerCase())) {
+                        const regex = new RegExp(`(${query})`, "gi");
+                        item.innerHTML = file.replace(regex, `<span class="mention-matched-text">$1</span>`);
+                    }
+                    
+                    mentionDropdown.appendChild(item);
+                });
+                mentionDropdown.style.display = "block";
+            }
+
+            fileInput.addEventListener("change", (e) => {
+                if (e.target.files.length > 0) {
+                    attachedFile = e.target.files[0];
+                    fileNameDisplay.textContent = "📎 " + attachedFile.name;
+                    fileIndicator.style.display = "flex";
+                }
+            });
+
+            removeFileBtn.addEventListener("click", () => {
+                attachedFile = null;
+                fileInput.value = "";
+                fileIndicator.style.display = "none";
+            });
+            // ------------------------------------------
 
             // Connect Socket (Adjust if backend is on different URL)
             const socket = io(window.location.origin);
@@ -257,35 +455,140 @@
                 scrollToBottom();
             });
 
+            // --- UPDATED: handleSendMessage ---
             const handleSendMessage = (e) => {
                 if (e) e.preventDefault();
                 if (isRequestInProgress) { socket.emit("stop_generation"); resetInputState(); return; }
+                
                 const text = userInput.value.trim();
-                if (!text) return;
+                // Ensure we don't send if EVERYTHING is empty
+                if (!text && !attachedFile && selectedMentions.length === 0) return;
 
                 isRequestInProgress = true; toggleButtonState(true);
-                appendMessage(text, "user-message");
+                
+                // Construct the user display message showing their tags and file uploads
+                let displayMsg = "";
+                if (attachedFile) displayMsg += `[Uploaded: ${attachedFile.name}]\n`;
+                if (selectedMentions.length > 0) displayMsg += `[Searching in: ${selectedMentions.join(", ")}]\n`;
+                displayMsg += text;
+                
+                appendMessage(displayMsg.trim(), "user-message");
+                
                 userInput.value = ""; userInput.style.height = '54px'; 
                 showLoadingIndicator();
-                socket.emit("chat_request", { message: text });
+
+                // Send the exact array of selected files directly to the backend! No regex needed.
+                const payload = { 
+                    message: text,
+                    target_files: [...selectedMentions] 
+                };
+
+                // Clear tags UI
+                selectedMentions = [];
+                renderSelectedTags();
+
+                if (attachedFile) {
+                    const reader = new FileReader();
+                    reader.onload = function(event) {
+                        payload.file = { name: attachedFile.name, data: event.target.result };
+                        socket.emit("chat_request", payload);
+                        attachedFile = null;
+                        fileInput.value = "";
+                        fileIndicator.style.display = "none";
+                    };
+                    reader.readAsArrayBuffer(attachedFile);
+                } else {
+                    socket.emit("chat_request", payload);
+                }
             };
 
             chatForm.addEventListener("submit", handleSendMessage);
-            userInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
-                    if (e.shiftKey) {
-                        // Allow default behavior (new line)
-                        return;
-                    } else {
-                        // Prevent default (new line) and send message
-                        e.preventDefault();
-                        if (!isRequestInProgress) {
-                            chatForm.dispatchEvent(new Event('submit'));
+
+            userInput.addEventListener("input", (e) => {
+                const val = userInput.value;
+                const cursorPosition = userInput.selectionStart;
+                const textBeforeCursor = val.substring(0, cursorPosition);
+                const lastAtPos = textBeforeCursor.lastIndexOf('@');
+                
+                if (lastAtPos !== -1) {
+                    mentionActive = true;
+                    mentionStartIndex = lastAtPos;
+                    mentionQuery = textBeforeCursor.substring(lastAtPos + 1);
+                    
+                    const matchedFiles = availableFiles.filter(f => {
+                        if (!mentionQuery) return true; 
+                        const queryLower = mentionQuery.toLowerCase();
+                        const fileLower = f.toLowerCase();
+                        if (fileLower.includes(queryLower)) return true;
+                        
+                        let patternIdx = 0;
+                        const pattern = queryLower.replace(/\s/g, '');
+                        for (let i = 0; i < fileLower.length; i++) {
+                            if (fileLower[i] === pattern[patternIdx]) {
+                                patternIdx++;
+                                if (patternIdx === pattern.length) return true;
+                            }
                         }
+                        return false;
+                    }); 
+
+                    selectedMentionIndex = 0;
+                    renderMentionDropdown(matchedFiles, mentionQuery);
+                } else {
+                    mentionActive = false;
+                    mentionDropdown.style.display = "none";
+                }
+                
+                userInput.style.height = 'auto'; 
+                userInput.style.height = (userInput.scrollHeight) + 'px'; 
+                userInput.style.overflowY = userInput.scrollHeight > 150 ? 'auto' : 'hidden';
+            });
+
+            userInput.addEventListener("keydown", (e) => {
+                // --- DROPDOWN NAVIGATION LOGIC ---
+                if (mentionActive && mentionDropdown.style.display === "block") {
+                    const items = mentionDropdown.querySelectorAll(".mention-item");
+                    if (items.length === 0) return;
+
+                    if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        items[selectedMentionIndex].classList.remove("active");
+                        selectedMentionIndex = (selectedMentionIndex + 1) % items.length;
+                        items[selectedMentionIndex].classList.add("active");
+                        items[selectedMentionIndex].scrollIntoView({ block: "nearest" });
+                    } else if (e.key === "ArrowUp") {
+                        e.preventDefault();
+                        items[selectedMentionIndex].classList.remove("active");
+                        selectedMentionIndex = (selectedMentionIndex - 1 + items.length) % items.length;
+                        items[selectedMentionIndex].classList.add("active");
+                        items[selectedMentionIndex].scrollIntoView({ block: "nearest" });
+                    } else if (e.key === "Enter" || e.key === "Tab") {
+                        e.preventDefault();
+                        if (items[selectedMentionIndex]) {
+                            insertMention(items[selectedMentionIndex].textContent);
+                        }
+                    } else if (e.key === "Escape") {
+                        mentionActive = false;
+                        mentionDropdown.style.display = "none";
+                    }
+                    return; 
+                }
+
+                if (e.key === 'Enter') {
+                    if (e.shiftKey) { return; } 
+                    else {
+                        e.preventDefault();
+                        if (!isRequestInProgress) chatForm.dispatchEvent(new Event('submit'));
                     }
                 }
             });
-            userInput.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = (this.scrollHeight) + 'px'; this.style.overflowY = this.scrollHeight > 150 ? 'auto' : 'hidden'; });
+
+            document.addEventListener("click", (e) => {
+                if (e.target !== userInput && e.target !== mentionDropdown) {
+                    mentionActive = false;
+                    mentionDropdown.style.display = "none";
+                }
+            });
 
             function toggleButtonState(processing) {
                 document.getElementById('send-icon').style.display = processing ? 'none' : 'block';

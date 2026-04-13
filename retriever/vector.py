@@ -14,6 +14,7 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
+from qdrant_client.http import models as rest
 from tqdm import tqdm
 import uuid
 import concurrent.futures
@@ -145,25 +146,27 @@ class HybridRetriever:
 
     # ── Public interface (LangChain-compatible) ──
 
-    def invoke(self, query: str) -> List[_Document]:
-        return self._retrieve(query)
+    # ── Public interface (LangChain-compatible) ──
 
-    async def ainvoke(self, query: str) -> List[_Document]:
-        return await asyncio.to_thread(self._retrieve, query)
+    def invoke(self, query: str, target_sources: list = None) -> List[_Document]:
+        return self._retrieve(query, target_sources)
 
-    def get_relevant_documents(self, query: str) -> List[_Document]:
-        return self._retrieve(query)
+    async def ainvoke(self, query: str, target_sources: list = None) -> List[_Document]:
+        return await asyncio.to_thread(self._retrieve, query, target_sources)
 
-    async def aget_relevant_documents(self, query: str) -> List[_Document]:
-        return await asyncio.to_thread(self._retrieve, query)
+    def get_relevant_documents(self, query: str, target_sources: list = None) -> List[_Document]:
+        return self._retrieve(query, target_sources)
+
+    async def aget_relevant_documents(self, query: str, target_sources: list = None) -> List[_Document]:
+        return await asyncio.to_thread(self._retrieve, query, target_sources)
 
     # ── Internal pipeline ────────────────────────
 
-    def _retrieve(self, query: str) -> List[_Document]:
+    def _retrieve(self, query: str, target_sources: list = None) -> List[_Document]:
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            bm25_future = executor.submit(self._bm25_search, query)
-            dense_future = executor.submit(self._dense_search, query)
-            graph_future = executor.submit(self._graph_search, query)
+            bm25_future = executor.submit(self._bm25_search, query, target_sources)
+            dense_future = executor.submit(self._dense_search, query, target_sources)
+            graph_future = executor.submit(self._graph_search, query, target_sources)
             try:
                 bm25_results = bm25_future.result()
             except Exception as e:
@@ -191,7 +194,7 @@ class HybridRetriever:
         # Stage 3: Cross-encoder reranking
         return self._rerank(query, fused)
 
-    def _bm25_search(self, query: str) -> List[_Document]:
+    def _bm25_search(self, query: str, target_sources: list = None) -> List[_Document]:
         if not self.corpus:
             return []
         tokens = tokenize(query)
@@ -204,14 +207,15 @@ class HybridRetriever:
         if max_score <= 0:
             return []
 
-        # Dynamic relative threshold
         threshold = max_score * self.bm25_score_ratio
         
-        # Filter and sort
         valid_indices = [i for i, s in enumerate(scores) if s >= threshold]
-        valid_indices.sort(key=lambda i: scores[i], reverse=True)
         
-        # Apply a generous upper limit for safety before RRF
+        # --- NEW: Filter by target_sources ---
+        if target_sources:
+            valid_indices = [i for i in valid_indices if self.corpus[i]["metadata"].get("source") in target_sources]
+            
+        valid_indices.sort(key=lambda i: scores[i], reverse=True)
         valid_indices = valid_indices[:self.max_candidates_per_retriever]
 
         return [
@@ -222,53 +226,61 @@ class HybridRetriever:
             for i in valid_indices
         ]
 
+    # --- ADD THIS MISSING VARIABLE BACK IN ---
     _GARBAGE_RE = re.compile(
         r'^[\s=\-\+\*\/\\\|\.\,\:\;\!\?\&\^\%\$\#\@\~\`\'\"\_\(\)\[\]\{\}A-Za-z0-9]{0,6}$'
     )
+    # -----------------------------------------
 
-    def _dense_search(self, query: str) -> List[_Document]:
-        results = self.vector_store.similarity_search_with_relevance_scores(
-            query, k=self.max_candidates_per_retriever
-        )
+    def _dense_search(self, query: str, target_sources: list = None) -> List[_Document]:
+        search_kwargs = {"k": self.max_candidates_per_retriever}
+        
+        # --- NEW: Apply Qdrant native filter for sources ---
+        if target_sources:
+            search_kwargs["filter"] = rest.Filter(
+                must=[
+                    rest.FieldCondition(
+                        key="metadata.source",
+                        match=rest.MatchAny(any=target_sources)
+                    )
+                ]
+            )
+
+        results = self.vector_store.similarity_search_with_relevance_scores(query, **search_kwargs)
+        
         valid_docs = []
         for r, score in results:
-            # Clamp floating-point overshoot from Qdrant normalisation
             score = min(float(score), 1.0)
-
             content = r.page_content.strip()
 
-            if score < self.vector_similarity_threshold:
-                continue
-            if len(content) < 15:                    # catches 'E', 'MU', 'k', '=', '-'
-                continue
-            if self._GARBAGE_RE.match(content):            # catches short symbol/char combos
-                continue
-            if content.count('\n') > len(content) * 0.4:  # catches '-\n-\n-\n-\n-' style
-                continue
+            if score < self.vector_similarity_threshold: continue
+            if len(content) < 15: continue
+            if self._GARBAGE_RE.match(content): continue
+            if content.count('\n') > len(content) * 0.4: continue
 
             valid_docs.append(_Document(page_content=r.page_content, metadata=r.metadata))
 
         return valid_docs
-    def _graph_search(self, query: str) -> List[_Document]:
+
+    def _graph_search(self, query: str, target_sources: list = None) -> List[_Document]:
         if self.graph_retriever is None:
             return []
         try:
-            # Assuming your graph_retriever can return scores (e.g., PageRank or edge weight)
-            # If it only returns raw docs, you may have to threshold by hop-distance instead.
             results = self.graph_retriever.invoke_with_scores(query) 
+            valid_docs = [doc for doc, score in results if score >= self.graph_score_threshold]
             
-            valid_docs = [
-                doc for doc, score in results 
-                if score >= self.graph_score_threshold
-            ]
+            # --- NEW: Filter graph docs ---
+            if target_sources:
+                valid_docs = [doc for doc in valid_docs if doc.metadata.get("source") in target_sources]
+                
             return valid_docs[:self.max_candidates_per_retriever]
-            
         except AttributeError:
-             # Fallback if your GraphRetriever doesn't support scores
              print("[GraphRetriever] Warning: No score mechanism found. Returning top-K.")
-             return self.graph_retriever.invoke(query)[:30]
+             docs = self.graph_retriever.invoke(query)[:30]
+             if target_sources:
+                 docs = [d for d in docs if d.metadata.get("source") in target_sources]
+             return docs
         except Exception as exc:
-            # Graph retrieval is best-effort; never crash the pipeline
             print(f"[GraphRetriever] warning: {exc}")
             return []
 
