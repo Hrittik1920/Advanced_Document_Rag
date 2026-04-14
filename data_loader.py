@@ -23,40 +23,41 @@ from llm_clients import query_ollama
 
 nest_asyncio.apply()
 
+#  NEW: Context-Prefixed Markdown (The Token-Optimized Table Solution)
+def table_to_context_markdown(df: pd.DataFrame, source: str, section: str) -> str:
+    """
+    Converts a dataframe chunk to a Markdown table and prepends a semantic context header.
+    This solves the 'RAG Table Dilemma' by combining token-efficiency (Markdown)
+    with high retrieval accuracy (Semantic Prefix mapping the columns).
+    """
+    # Extract readable column names
+    valid_columns = [str(c).strip() for c in df.columns if str(c).strip() and str(c).lower() != "nan"]
+    columns_text = ", ".join(valid_columns) if valid_columns else "unnamed columns"
+
+    # The semantic prefix forces the embedding model to understand the 2D Markdown structure
+    prefix = (
+        f"This chunk contains structured tabular data from the document '{source}', "
+        f"located in the section '{section}'. "
+        f"The table maps data across the following columns: {columns_text}.\n\n"
+    )
+    
+    # Generate the token-efficient Markdown
+    markdown_table = df.to_markdown(index=False)
+    
+    return prefix + markdown_table
+
 # ---------------------------------------------------------------------------
 class SemanticAwareTextSplitter:
     """
     Splits text into chunks that respect **semantic** (topic-shift) boundaries
     rather than fixed character counts.
-
-    Algorithm
-    ---------
-    1. Tokenize text into individual sentences (regex, no heavy deps).
-    2. Compute a *content-density score* from type-token ratio and average
-       word length → derive a target chunk size dynamically per document.
-    3. Detect semantic breakpoints via sliding-window cosine distance on
-       TF-IDF character n-gram vectors (falls back to Jaccard if sklearn is
-       absent).  A position is a boundary only when its distance is a local
-       maximum **and** exceeds an adaptive threshold (mean + 0.5 σ).
-    4. Greedily accumulate sentences; flush into a chunk when a semantic
-       boundary is hit (and accumulated size ≥ MIN) or the hard MAX is
-       reached.
-    5. Carry the final BRIDGE_SENTENCES of each chunk into the next one so
-       cross-boundary context is never lost.
-
-    Sizing contract
-    ---------------
-    Dense technical text  → smaller chunks  (≈ MIN_CHUNK_CHARS)
-    Narrative / sparse    → larger chunks   (≈ MAX_CHUNK_CHARS)
     """
-
     MIN_CHUNK_CHARS:    int   = 400
     BASE_CHUNK_CHARS:   int   = 1_200
     MAX_CHUNK_CHARS:    int   = 2_000
     BOUNDARY_THRESHOLD: float = 0.35   # Minimum cosine distance to be a boundary
     BRIDGE_SENTENCES:   int   = 1      # Sentences carried forward for context
 
-    # Regex fragments used in sentence protection
     _ABBREV_RE = re.compile(
         r'\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|Fig|No|Vol|pp)\.\s',
         re.IGNORECASE,
@@ -66,10 +67,6 @@ class SemanticAwareTextSplitter:
 
     def __init__(self) -> None:
         self._has_sklearn = self._try_import_sklearn()
-
-    # ------------------------------------------------------------------
-    # sklearn / fallback import
-    # ------------------------------------------------------------------
 
     def _try_import_sklearn(self) -> bool:
         try:
@@ -81,21 +78,7 @@ class SemanticAwareTextSplitter:
         except ImportError:
             return False
 
-    # ------------------------------------------------------------------
-    # Dynamic sizing
-    # ------------------------------------------------------------------
-
     def compute_target_size(self, text: str) -> int:
-        """
-        Returns a target chunk size (chars) suited to the text's density.
-
-        Density is a composite of:
-          - Type-token ratio   (high → many unique words → dense)
-          - Average word length (high → technical vocabulary)
-
-        density ∈ [0, 1]:  0 → narrative → MAX_CHUNK_CHARS
-                           1 → dense     → MIN_CHUNK_CHARS
-        """
         words = text.split()
         if not words:
             return self.BASE_CHUNK_CHARS
@@ -103,7 +86,6 @@ class SemanticAwareTextSplitter:
         unique_ratio = len({w.lower() for w in words}) / len(words)
         avg_word_len = sum(len(w) for w in words) / len(words)
 
-        # Clamp avg_word_len contribution at 8 chars (above that it's noise)
         density = min(1.0,
                       unique_ratio * 0.6
                       + min(avg_word_len, 8) / 8 * 0.4)
@@ -114,22 +96,7 @@ class SemanticAwareTextSplitter:
         )
         return max(self.MIN_CHUNK_CHARS, min(self.MAX_CHUNK_CHARS, target))
 
-    # ------------------------------------------------------------------
-    # Sentence tokenisation
-    # ------------------------------------------------------------------
-
     def tokenize_sentences(self, text: str) -> list[str]:
-        """
-        Sentence-boundary detection via punctuation-aware regex.
-
-        Protects:
-          - Common abbreviations  (Dr., Fig., etc.)
-          - Decimal numbers       (3.14)
-          - Ellipses              (…)
-
-        Minimum sentence length is 10 chars to suppress artefacts.
-        """
-        # Temporarily replace protected sequences with placeholder bytes
         protected = self._ABBREV_RE.sub(
             lambda m: m.group().replace(". ", ".\x00"), text
         )
@@ -147,15 +114,7 @@ class SemanticAwareTextSplitter:
 
         return sentences or [text.strip()]
 
-    # ------------------------------------------------------------------
-    # Semantic boundary detection
-    # ------------------------------------------------------------------
-
     def _pairwise_distances(self, sentences: list[str]) -> list[float]:
-        """
-        Returns cosine distance between every adjacent sentence pair.
-        Falls back to Jaccard word-set distance when sklearn is absent.
-        """
         if len(sentences) < 2:
             return []
 
@@ -174,7 +133,6 @@ class SemanticAwareTextSplitter:
             except Exception:
                 pass  # Fall through to Jaccard
 
-        # Jaccard fallback
         def _jaccard(a: str, b: str) -> float:
             sa, sb = set(a.lower().split()), set(b.lower().split())
             if not sa and not sb:
@@ -185,13 +143,6 @@ class SemanticAwareTextSplitter:
                 for i in range(len(sentences) - 1)]
 
     def find_semantic_boundaries(self, sentences: list[str]) -> set[int]:
-        """
-        Returns the set of sentence indices where a new chunk should begin.
-
-        A position qualifies when:
-          - Its cosine distance is a local maximum among its neighbours, AND
-          - It exceeds max(BOUNDARY_THRESHOLD, mean + 0.5 σ) of all distances.
-        """
         distances = self._pairwise_distances(sentences)
         if not distances:
             return set()
@@ -209,19 +160,11 @@ class SemanticAwareTextSplitter:
             left  = distances[i - 1] if i > 0                   else -1.0
             right = distances[i + 1] if i + 1 < len(distances)  else -1.0
             if d >= left and d >= right:
-                boundaries.add(i + 1)   # boundary starts *before* sentence[i+1]
+                boundaries.add(i + 1)
 
         return boundaries
 
-    # ------------------------------------------------------------------
-    # Public split interface
-    # ------------------------------------------------------------------
-
     def split(self, text: str) -> list[str]:
-        """
-        Split *text* into semantically coherent, density-sized chunks.
-        Each chunk is a single string (sentences joined by spaces).
-        """
         sentences = self.tokenize_sentences(text)
         if len(sentences) <= 1:
             return [text.strip()] if text.strip() else []
@@ -246,7 +189,6 @@ class SemanticAwareTextSplitter:
 
             if flush:
                 chunks.append(" ".join(current))
-                # Bridge: carry trailing sentences for cross-boundary context
                 bridge  = current[-self.BRIDGE_SENTENCES:] if self.BRIDGE_SENTENCES else []
                 current = list(bridge)
                 current_len = sum(len(s) for s in current)
@@ -259,18 +201,8 @@ class SemanticAwareTextSplitter:
 
         return chunks
 
-    # ------------------------------------------------------------------
-    # Dynamic table sizing helper (used by HeaderAwareTextSplitter)
-    # ------------------------------------------------------------------
-
     @staticmethod
     def dynamic_table_rows(df: "pd.DataFrame", target_chars: int = 1_000) -> int:
-        """
-        Compute how many rows to include per table chunk so that each chunk
-        is approximately *target_chars* characters of Markdown.
-
-        Bounds:  [5, 60] rows.
-        """
         if df.empty:
             return 30
         sample = min(10, len(df))
@@ -284,38 +216,21 @@ class SemanticAwareTextSplitter:
 
 
 # ---------------------------------------------------------------------------
-# Heading / topic-aware splitter  (uses SemanticAwareTextSplitter internally)
+# Heading / topic-aware splitter
 # ---------------------------------------------------------------------------
 
 class HeaderAwareTextSplitter:
-    """
-    Splits text into chunks that respect section boundaries (headers/topics).
-
-    Strategy
-    --------
-    1. Use format-specific section extractor to get (header, body) pairs.
-    2. Bodies that fit within *target_size* chars are kept as-is.
-    3. Bodies that exceed *target_size* are sub-split by SemanticAwareTextSplitter
-       (sentence-level, adaptive size, semantic boundary detection).
-    4. Sub-chunks carry the final sentence of the previous sub-chunk as a
-       "bridge" prefix — a genuine context window, not an arbitrary overlap.
-    5. With no headers, fall back to paragraph grouping then semantic splitting.
-    """
-
     CONTEXT_MODEL = settings.CONTEXT_MODEL
 
     def __init__(self):
         self._semantic_splitter = SemanticAwareTextSplitter()
+
     def _generate_chunk_id(self, text: str, meta: dict) -> str:
-        """Generates a deterministic ID based on source and content."""
         source = meta.get("source", "unknown")
-        # Hash the source and the first 100 chars of content
         unique_string = f"{source}::{text[:100]}"
         return hashlib.sha256(unique_string.encode('utf-8')).hexdigest()[:12]
     
-    #Adding contextual ware embed chunk generation using the ollama model
     async def _generate_chunk_context(self, doc_title: str, section: str, chunk_text: str) -> str:
-        """Generate a 1-2 sentence context prefix that situates this chunk in the document."""
         prompt = (
             f"Document: {doc_title}\n"
             f"Section: {section or 'main body'}\n\n"
@@ -324,7 +239,6 @@ class HeaderAwareTextSplitter:
             "Be specific. Return only those sentences. Do not use conversational filler."
         )
         try:
-            # Note: Assuming query_ollama yields text chunks based on your OCR code
             response_gen = query_ollama(prompt=prompt, model=self.CONTEXT_MODEL, keep_alive=0,num_ctx_tokens=10_000, stream=False)
             parts = []
             async for chunk in response_gen:
@@ -333,21 +247,13 @@ class HeaderAwareTextSplitter:
         except Exception as e:
             print(f"⚠️ Context generation failed: {e}")
             return ""
-    
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def split_sections(
         self,
-        sections: list[tuple[str, str]],   # [(header, body), ...]
+        sections: list[tuple[str, str]],
         base_metadata: dict,
         is_table: bool = False,
     ) -> list[Document]:
-        """
-        Convert pre-parsed (header, body) pairs into Documents.
-        Applies sub-splitting only when a section body exceeds MAX_SECTION_CHARS.
-        """
         docs = []
         for header, body in sections:
             body = body.strip()
@@ -357,18 +263,18 @@ class HeaderAwareTextSplitter:
             meta = {**base_metadata, "section": header} if header else base_metadata.copy()
             meta["is_table"] = is_table
             contextualized_body = f"[{header}]\n{body}" if header else body
-            if is_table :
+            
+            if is_table:
                 meta["chunk_id"] = self._generate_chunk_id(body, meta)
                 docs.append(Document(page_content=contextualized_body, metadata=meta))
                 continue
+            
             target_size = self._semantic_splitter.compute_target_size(body)
 
             if len(body) <= target_size:
-                # Body fits in one chunk
                 meta["chunk_id"] = self._generate_chunk_id(body, meta)
                 docs.append(Document(page_content=contextualized_body, metadata=meta))
             else:
-                # Semantically sub-split the oversized body
                 sub_texts = self._semantic_splitter.split(body)
 
                 for idx, sub_text in enumerate(sub_texts):
@@ -378,8 +284,6 @@ class HeaderAwareTextSplitter:
 
                     is_continuation = idx > 0
                     if is_continuation and header:
-                        # Prefix with bridge context already embedded by the
-                        # SemanticAwareTextSplitter; add a readable label too.
                         label   = f"[{header} — part {idx + 1} of {len(sub_texts)}]"
                     elif header:
                         label = f"[{header}]"
@@ -392,9 +296,7 @@ class HeaderAwareTextSplitter:
                         f"{self._generate_chunk_id(sub_text, meta)}_{idx}"
                     )
                     sub_meta["part"] = f"{idx + 1}/{len(sub_texts)}"
-                    docs.append(
-                        Document(page_content=content, metadata=sub_meta)
-                    )
+                    docs.append(Document(page_content=content, metadata=sub_meta))
 
         return docs
     
@@ -405,24 +307,18 @@ class HeaderAwareTextSplitter:
         is_table: bool = False,
     ) -> list[Document]:
         """
-        Splits sections and adds an AI-generated context prefix to text chunks.
-        Tables bypass context generation to save massive amounts of compute time.
+        Splits sections and adds context. Tables bypass the LLM generation 
+        because their semantic prefix is already mapped during markdown conversion.
         """
-        # First, get the standard docs using your existing logic
         docs = self.split_sections(sections, base_metadata, is_table=is_table)
-
         doc_title = base_metadata.get("source", "unknown_document")
 
         if is_table:
-            section = base_metadata.get("section", "Table")
-            
+            # 🔥 tables already have their explicit context mapped by table_to_context_markdown
             for doc in docs:
-                # Manually inject a rigid context prefix for tables
-                doc.metadata["embed_content"] = (f"[Source: {doc_title} | Section: {section}]\n\n{doc.page_content}")
+                doc.metadata["embed_content"] = doc.page_content
             return docs
 
-        # Create a Semaphore to limit Ollama to processing 4 chunks at a time
-        # Change this number based on your GPU VRAM (lower if it crashes, higher if GPU usage is low)
         sem = asyncio.Semaphore(2)
 
         async def bounded_generate(d: Document) -> str:
@@ -437,7 +333,6 @@ class HeaderAwareTextSplitter:
             tasks = [bounded_generate(d) for d in docs]
             return await asyncio.gather(*tasks)
 
-        # Run the async generation
         try:
             loop = asyncio.get_event_loop()
             contexts = loop.run_until_complete(enrich_all())
@@ -454,63 +349,39 @@ class HeaderAwareTextSplitter:
         return docs
     
     def split_plain_text(self, text: str, base_metadata: dict) -> list[Document]:
-        """
-        Detect headers in raw text, then call split_sections.
-        Falls back to paragraph grouping if no headers are found.
-        """
         sections = _detect_text_headers(text)
         if sections:
             return self.split_sections(sections, base_metadata)
-
-        # No headers — split by paragraphs, merge small ones
         sections = _paragraph_sections(text=text, splitter=self._semantic_splitter)
         return self.split_sections(sections, base_metadata)
 
 
 # ---------------------------------------------------------------------------
-# Header detection helpers (module-level, no state needed)
+# Header detection helpers
 # ---------------------------------------------------------------------------
 
-# Matches: "# Header", "## Sub", "### Sub-sub"
 _MARKDOWN_HEADER_RE = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
-
-# Matches: "1.2.3  Some Title", "CHAPTER 3 — INTRO", all-caps short lines
 _GENERIC_HEADER_RE = re.compile(
     r"^(?:"
-    # Numbered: "1.2 Section Title" (Allows for extra spaces from OCR)
     r"(?:\d+[.\d]+\s+[A-Z].{3,60})" 
-    # ALL CAPS line (Allows numbers and symbols like '&' often found in headers)
     r"|(?:[A-Z0-9][A-Z0-9\s\-&]{4,60}[A-Z0-9])" 
-    # Keyword + number (Accounts for OCR missing the space, e.g., "Chapter3")
     r"|(?:(?:Chapter|Section|Part|Appendix)\s*[\dIVXivx]+.?)" 
     r")$",
-    re.MULTILINE | re.IGNORECASE, # Added ignorecase for 'chapter' vs 'Chapter'
+    re.MULTILINE | re.IGNORECASE,
 )
 
-
 def _detect_text_headers(text: str) -> list[tuple[str, str]]:
-    """
-    Returns [(header_label, section_body), ...] or [] if no headers found.
-    Tries Markdown headers first, then generic pattern headers.
-    """
-    # --- Markdown-style ---
     matches = list(_MARKDOWN_HEADER_RE.finditer(text))
     if len(matches) >= 2:
         return _build_sections_from_matches(text, matches, label_group=2)
 
-    # --- Generic / academic style ---
     matches = list(_GENERIC_HEADER_RE.finditer(text))
     if len(matches) >= 2:
         return _build_sections_from_matches(text, matches, label_group=0)
 
     return []
 
-
-def _build_sections_from_matches(
-    text: str,
-    matches: list,
-    label_group: int,
-) -> list[tuple[str, str]]:
+def _build_sections_from_matches(text: str, matches: list, label_group: int) -> list[tuple[str, str]]:
     sections = []
     for idx, match in enumerate(matches):
         header = match.group(label_group).strip()
@@ -520,12 +391,7 @@ def _build_sections_from_matches(
         sections.append((header, body))
     return sections
 
-
 def _paragraph_sections(text: str, splitter: "SemanticAwareTextSplitter | None" =None, min_chars: int = 100) -> list[tuple[str, str]]:
-    """
-    Splits text into paragraph blocks, merging tiny paragraphs
-    with the next one to avoid single-sentence micro-chunks.
-    """
     raw_paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     merged: list[str] = []
     buffer = ""
@@ -536,14 +402,13 @@ def _paragraph_sections(text: str, splitter: "SemanticAwareTextSplitter | None" 
             buffer = ""
     if buffer:
         if merged:
-            merged[-1] += "\n\n" + buffer   # attach trailing fragment to last chunk
+            merged[-1] += "\n\n" + buffer
         else:
             merged.append(buffer)
 
     if not splitter:
         return [("", block) for block in merged]
 
-    # Sub-split oversized paragraphs semantically (no header label needed here)
     sections: list[tuple[str, str]] = []
     max_size = splitter.MAX_CHUNK_CHARS
     for block in merged:
@@ -560,36 +425,25 @@ def _paragraph_sections(text: str, splitter: "SemanticAwareTextSplitter | None" 
 # DOCX-specific section extractor
 # ---------------------------------------------------------------------------
 def _is_toc_page(text: str) -> bool:
-        """
-        Detects if a block of text is primarily a Table of Contents.
-        Looks for lines ending in multiple dots followed by numbers.
-        """
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        if not lines:
-            return False
-            
-        # Regex: looks for 4+ dots, optional spaces, and digits at the end of a line
-        toc_line_pattern = re.compile(r'\.{4,}\s*\d+$')
-        
-        toc_count = sum(1 for line in lines if toc_line_pattern.search(line))
-        ratio = toc_count / len(lines)
-        
-        # If more than 25% of the page is TOC lines, drop it
-        return ratio > 0.25
-def _extract_docx_sections(docx: DocxDocument) -> list[tuple[str, str]]:
-    """
-    Walk paragraphs; whenever we hit a Heading style, start a new section.
-    Returns [(heading_text, section_body), ...].
-    Falls back to returning all text as one unnamed section if no headings exist.
-    """
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if not lines:
+        return False
+    toc_line_pattern = re.compile(r'\.{4,}\s*\d+$')
+    toc_count = sum(1 for line in lines if toc_line_pattern.search(line))
+    ratio = toc_count / len(lines)
+    return ratio > 0.25
+
+def _extract_docx_sections(docx: DocxDocument, source_name: str) -> list[tuple[str, str]]:
     text_sections: list[tuple[str, str]] = []
     table_sections: list[tuple[str, str]] = []
+
     current_heading = ""
     current_body_lines: list[str] = []
 
     for para in docx.paragraphs:
         style_name = para.style.name if para.style else ""
         text = para.text.strip()
+
         if not text:
             continue
 
@@ -611,22 +465,27 @@ def _extract_docx_sections(docx: DocxDocument) -> list[tuple[str, str]]:
         for row in table.rows:
             row_data = [cell.text.strip().replace("\n", " ") for cell in row.cells]
             data.append(row_data)
-            
+
         if len(data) > 1:
             df = pd.DataFrame(data[1:], columns=data[0])
+
             try:
-                rows_per_chunk = _semantic_splitter.dynamic_table_rows(df)
+                rows_per_chunk = max(20, _semantic_splitter.dynamic_table_rows(df))
                 for start_row in range(0, len(df), rows_per_chunk):
-                    df_chunk = df.iloc[start_row : start_row + rows_per_chunk]
-                    md_table = df_chunk.to_markdown(index=False)
-                    
-                    if md_table:
+                    df_chunk = df.iloc[start_row:start_row + rows_per_chunk]
+
+                    #  NEW: Use Context-Prefixed Markdown
+                    content = table_to_context_markdown(
+                        df_chunk, 
+                        source_name, 
+                        current_heading or f"Table {i + 1}"
+                    )
+
+                    if content:
                         end_row = start_row + len(df_chunk)
-                        header  = (
-                            f"{current_heading} — Table {i + 1} "
-                            f"(rows {start_row + 1}–{end_row})"
-                        )
-                        table_sections.append((header, md_table))
+                        header = f"{current_heading or 'DOCX Section'} — Table {i + 1} (rows {start_row + 1}–{end_row})"
+                        table_sections.append((header, content))
+
             except Exception as e:
                 print(f"Skipping malformed DOCX table: {e}")
 
@@ -634,14 +493,10 @@ def _extract_docx_sections(docx: DocxDocument) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# PDF-specific header heuristic (applied after text extraction)
+# PDF-specific header heuristic
 # ---------------------------------------------------------------------------
 
 def _extract_pdf_sections(text: str) -> list[tuple[str, str]]:
-    """
-    Runs header detection on extracted PDF text.
-    Identical to the generic text path but kept separate for clarity.
-    """
     return _detect_text_headers(text) or _paragraph_sections(text)
 
 
@@ -649,12 +504,6 @@ def _extract_pdf_sections(text: str) -> list[tuple[str, str]]:
 # Main loader class
 # ---------------------------------------------------------------------------
 class MultiFormatDocumentLoader:
-    """
-    Load and process various document formats using header/topic-aware chunking.
-    Chunks align with document structure (sections, headings) rather than
-    arbitrary character counts.
-    """
-
     def __init__(self):
         self.supported_extensions = {
             ".pdf", ".docx", ".csv", ".xlsx", ".xls", ".txt",
@@ -663,52 +512,25 @@ class MultiFormatDocumentLoader:
         self.splitter = HeaderAwareTextSplitter()
         self._semantic_splitter = SemanticAwareTextSplitter()
 
-
-    # ------------------------------------------------------------------
-    # OCR helpers (unchanged from original)
-    # ------------------------------------------------------------------
     def _detect_table_grid_cv2(self, image_path: str) -> bool:
-        """
-        Quickly scans an image for horizontal and vertical grid lines.
-        Returns True if a table structure is detected.
-        """
         try:
             img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
             if img is None:
                 return False
-
-            # Binarize the image (invert so lines are white, background is black)
             _, thresh = cv2.threshold(img, 128, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-
-            # Define kernels to detect horizontal and vertical lines
-            # The length of the kernel dictates how long a line must be to be detected
             line_min_length = np.array(img).shape[1] // 10 
-            
             kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (line_min_length, 1))
             kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, line_min_length))
-
-            # Isolate horizontal lines
             horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
-            # Isolate vertical lines
             vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_v)
-
-            # Find intersections (where a horizontal and vertical line meet)
             intersections = cv2.bitwise_and(horizontal, vertical)
-
-            # Count the intersections
             contours, _ = cv2.findContours(intersections, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # If we have a decent number of intersections (e.g., 4+ corners), it's likely a table
             return len(contours) > 6
-
         except Exception as e:
             print(f"⚠️ Error during OpenCV table detection: {e}")
             return False
+
     def _looks_like_borderless_table(self, text: str) -> bool:
-        """
-        Analyzes OCR text for tabular spacing.
-        Returns True if multiple lines have 3+ distinct columns separated by wide spaces.
-        """
         if not text:
             return False
         lines = text.split("\n")
@@ -716,6 +538,7 @@ class MultiFormatDocumentLoader:
             1 for line in lines if len(re.split(r"\s{3,}", line.strip())) >= 3
         )
         return tabular_line_count >= 3
+
     async def _get_ocr_text_async(self, file_path: str, origin_info: str = "Image") -> str:
         ocr_text = ""
         confidence = 0
@@ -781,20 +604,11 @@ class MultiFormatDocumentLoader:
             asyncio.set_event_loop(loop)
         return loop.run_until_complete(self._get_ocr_text_async(file_path, origin_info))
 
-    # ------------------------------------------------------------------
-    # Format loaders
-    # ------------------------------------------------------------------
-
     def load_image(self, file_path: str) -> list[Document]:
-        """
-        Images produce a single document — OCR output has no reliable
-        heading structure to split on.
-        """
         print(f"⏳ Processing image: {os.path.basename(file_path)}")
         text = self._run_async_ocr(file_path, os.path.basename(file_path))
         if not text:
             return []
-        # Still attempt header-based splitting in case the image is a scanned doc
         metadata = {"source": os.path.basename(file_path), "file_type": "image"}
         return self.splitter.split_plain_text(text, metadata)
 
@@ -804,7 +618,6 @@ class MultiFormatDocumentLoader:
             return []
 
         table_docs: list[Document] = []
-        # NEW: collect (page_num, page_text) instead of one combined string
         page_texts: list[tuple[int, str]] = []
 
         base_metadata = {
@@ -816,36 +629,59 @@ class MultiFormatDocumentLoader:
             with fitz.open(file_path) as f:
                 for page_num, page in enumerate(f):
                     page_text = page.get_text().strip() or ""
+
                     if _is_toc_page(page_text):
                         print(f"⏩ Skipping TOC on page {page_num + 1}")
                         continue
-                    tables = page.find_tables()
+                    print(f"📄 Processing page {page_num + 1}")
+
+                    try:
+                        tables = page.find_tables()
+                    except Exception as e:
+                        print(f"⚠️ Table extraction failed on page {page_num + 1}: {e}")
+                        tables = []
+
                     if tables:
                         page_text += "\n\n### Extracted Tabular Data\n\n"
+
                         for idx, tab in enumerate(tables):
                             try:
-                                df=tab.to_pandas()
-                                df.dropna(how="all", inplace=True)  # Drop empty rows
+                                df = tab.to_pandas()
+                                df.dropna(how="all", inplace=True)
+                                
+                                #  SAFETY: Skip huge tables
+                                if len(df) > 2000:
+                                    print(f"⚠️ Skipping huge table on page {page_num + 1}")
+                                    continue
+
                                 if not df.empty:
-                                    rows_per_chunk = (self._semantic_splitter.dynamic_table_rows(df))
+                                    rows_per_chunk = max(
+                                        20,
+                                        self._semantic_splitter.dynamic_table_rows(df)
+                                    )
+
                                     for start_row in range(0, len(df), rows_per_chunk):
-                                        df_chunk = df.iloc[start_row : start_row + rows_per_chunk]
-                                        md_table = df_chunk.to_markdown(index=False)
-                                        
-                                        if md_table:
+                                        df_chunk = df.iloc[start_row:start_row + rows_per_chunk]
+
+                                        # 🔥 NEW: Context-Prefixed Markdown
+                                        content = table_to_context_markdown(
+                                            df_chunk,
+                                            base_metadata["source"],
+                                            f"Table {idx + 1} (page {page_num + 1})"
+                                        )
+
+                                        if content:
                                             end_row = start_row + len(df_chunk)
                                             table_meta = {
                                                 **base_metadata,
                                                 "page": page_num + 1,
+                                                "data_type": "table",
                                             }
-                                            header = (
-                                                f"Table {idx + 1} "
-                                                f"(page {page_num + 1}, "
-                                                f"rows {start_row + 1}–{end_row})"
-                                            )
+                                            header = f"Table {idx + 1} (page {page_num + 1}, rows {start_row + 1}–{end_row})"
+
                                             table_docs.extend(
                                                 self.splitter.split_sections_with_context(
-                                                    [(header, md_table)],
+                                                    [(header, content)],
                                                     table_meta,
                                                     is_table=True,
                                                 )
@@ -853,37 +689,35 @@ class MultiFormatDocumentLoader:
                             except Exception as e:
                                 print(f"Error extracting table from PDF page: {e}")
 
-                    # ── Accumulate text with its page number ──────────────
                     if page_text:
-                        page_texts.append((page_num + 1, page_text))   # 1-based
+                        page_texts.append((page_num + 1, page_text))
 
         except Exception as e:
             print(f"Error reading PDF {file_path}: {e}")
             return []
 
         text_docs: list[Document] = []
-
         total_text = "".join(t for _, t in page_texts)
 
         if len(total_text.strip()) > 200:
             bridge = ""
             for page_num, page_text in page_texts:
-                # prepend the last sentence from the previous page
                 text_with_bridge = (bridge + " " + page_text).strip() if bridge else page_text
-
                 page_meta = {**base_metadata, "page": page_num}
                 sections = _extract_pdf_sections(text_with_bridge)
+
                 text_docs.extend(
                     self.splitter.split_sections_with_context(
-                        sections, page_meta, is_table=False
+                        sections,
+                        page_meta,
+                        is_table=False
                     )
                 )
 
-                # carry the last sentence of this page into the next iteration
                 sentences = page_text.split(". ")
                 bridge = sentences[-1].strip() if sentences else ""
+
         else:
-            # ── Scanned PDF: OCR path (unchanged logic, already per-page) ──
             print(f"⚠️  Scanned PDF detected: {os.path.basename(file_path)}")
             try:
                 images = convert_from_path(file_path)
@@ -894,22 +728,31 @@ class MultiFormatDocumentLoader:
                     ocr_text = self._run_async_ocr(temp_path, f"Page {i + 1}")
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
+
                     if not ocr_text:
                         continue
-                    page_meta = {**base_metadata, "file_type": "pdf_scanned", "page": i + 1}
+
+                    page_meta = {
+                        **base_metadata,
+                        "file_type": "pdf_scanned",
+                        "page": i + 1
+                    }
                     sections = _detect_text_headers(ocr_text) or [("", ocr_text)]
                     text_docs.extend(
                         self.splitter.split_sections_with_context(sections, page_meta)
                     )
+
             except Exception as e:
-                print(f"Error loading TXT {file_path}: {e}")
+                print(f"Error loading scanned PDF: {e}")
                 return []
 
-        final_docs =table_docs + text_docs
+        final_docs = table_docs + text_docs
+
         if not final_docs and total_text.strip():
             return self.splitter.split_plain_text(total_text, base_metadata)
+
         return final_docs
-    
+
     def load_docx(self, file_path: str) -> list[Document]:
         try:
             docx = DocxDocument(file_path)
@@ -917,34 +760,31 @@ class MultiFormatDocumentLoader:
             print(f"Error loading DOCX {file_path}: {e}")
             return []
 
-        text_sections, table_sections = _extract_docx_sections(docx)
-        metadata = {"source": os.path.basename(file_path), "file_type": "docx"}
+        source_name = os.path.basename(file_path)
+        text_sections, table_sections = _extract_docx_sections(docx, source_name)
+        metadata = {"source": source_name, "file_type": "docx"}
         
-        # Process text and tables separately to protect the tables
         docs = self.splitter.split_sections_with_context(text_sections, metadata, is_table=False)
         docs.extend(self.splitter.split_sections_with_context(table_sections, metadata, is_table=True))
         return docs
 
     def load_csv(self, file_path: str, rows_per_chunk: int = 250) -> list[Document]:
-        """
-        CSVs have no heading structure; row-group chunking is the right
-        semantic boundary here — unchanged from original.
-        """
         docs = []
+        source_name = os.path.basename(file_path)
         try:
             for i, df_chunk in enumerate(
                 pd.read_csv(file_path, on_bad_lines="skip", chunksize=rows_per_chunk, low_memory=True)
             ):
-                buf = io.StringIO()
-                content=df_chunk.to_markdown(index=False)
+                content = table_to_context_markdown(df_chunk, source_name, "CSV Data")
                 if content:
                     start = i * rows_per_chunk + 1
                     docs.append(Document(
                         page_content=content,
                         metadata={
-                            "source": os.path.basename(file_path),
+                            "source": source_name,
                             "rows": f"{start}-{start + len(df_chunk) - 1}",
                             "file_type": "csv_chunk",
+                            "embed_content": content # Pre-mapped for tables
                         },
                     ))
         except Exception as e:
@@ -952,20 +792,16 @@ class MultiFormatDocumentLoader:
         return docs
 
     def load_excel(self, file_path: str, rows_per_chunk: int = 250) -> list[Document]:
-        """
-        Each sheet is treated as a named section; within a sheet,
-        further splitting uses the plain-text path if the sheet is large.
-        """
         docs = []
+        source_name = os.path.basename(file_path)
         try:
             xls = pd.ExcelFile(file_path)
             for sheet_name in xls.sheet_names:
                 df = pd.read_excel(file_path, sheet_name=sheet_name)
                 
-                # Manually slice the dataframe into chunks
                 for start_row in range(0, len(df), rows_per_chunk):
                     df_chunk = df.iloc[start_row : start_row + rows_per_chunk]
-                    content = df_chunk.to_markdown(index=False)
+                    content = table_to_context_markdown(df_chunk, source_name, f"Sheet: {sheet_name}")
                     
                     if content:
                         start_idx = start_row + 1
@@ -973,11 +809,12 @@ class MultiFormatDocumentLoader:
                         docs.append(Document(
                             page_content=content,
                             metadata={
-                                "source": os.path.basename(file_path),
+                                "source": source_name,
                                 "sheet": sheet_name,
                                 "rows": f"{start_idx}-{end_idx}",
                                 "file_type": "excel_chunk",
-                                "is_table": True
+                                "is_table": True,
+                                "embed_content": content # Pre-mapped for tables
                             },
                         ))
         except Exception as e:
@@ -994,10 +831,6 @@ class MultiFormatDocumentLoader:
 
         metadata = {"source": os.path.basename(file_path), "file_type": "txt"}
         return self.splitter.split_plain_text(text, metadata)
-
-    # ------------------------------------------------------------------
-    # Dispatcher
-    # ------------------------------------------------------------------
 
     def load_document(self, file_path: str) -> list[Document]:
         ext = Path(file_path).suffix.lower()
@@ -1019,20 +852,14 @@ class MultiFormatDocumentLoader:
             return loader(file_path)
         print(f"Unsupported file type: {ext}")
         return []
-    
-    
-    
+
 def dump_chunks_to_file(
     docs: list,
     output_path: str = "vector.txt",
     encoding: str = "utf-8",
     no_change: bool = False,
-    mode: str = "w"  # <-- Added mode to allow appending
+    mode: str = "w" 
 ) -> None:
-    """
-    Write document chunks along with metadata to a plain-text file.
-    Supports streaming chunks in real-time using mode="a".
-    """
     if no_change or not docs:
         return
 
@@ -1051,7 +878,6 @@ def dump_chunks_to_file(
     THIN  = "-" * 80
 
     with open(output_path, mode, encoding=encoding, errors="replace") as f:
-        # Only write a main header if we are starting a fresh file
         if mode == "w":
             f.write("=== VECTOR CHUNK DUMP ===\n\n")
 
@@ -1063,16 +889,13 @@ def dump_chunks_to_file(
             f.write("CHUNK\n")
             f.write(THIN + "\n")
 
-            # Known metadata fields
             for key in KNOWN_KEYS:
                 if key in meta:
                     label = LABELS[key]
                     f.write(f"{label}: {meta[key]}\n")
 
-            # Char count
             f.write(f"CHARS    : {len(content)}\n")
 
-            # Any extra/unknown metadata keys
             extra = {k: v for k, v in meta.items() if k not in KNOWN_KEYS}
             if extra:
                 f.write(f"OTHER    : {extra}\n")

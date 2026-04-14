@@ -30,7 +30,6 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 # --- Global Task Tracker ---
 active_tasks: Dict[str, asyncio.Task] = {}
-
 def get_today_log_file():
     today = datetime.now().strftime("%d%m%Y")
     return os.path.join(LOG_DIR, f"log{today}.txt")
@@ -191,13 +190,11 @@ async def handle_chat_request(sid, data: dict):
     finally:
         # Always clean up the task from memory
         active_tasks.pop(sid, None)
-        
+       
 async def run_llm_logic(sid, data: dict):
     """Actual RAG and LLM logic extracted from the main handler."""
     user_query = data.get("message", "")
     log_debug(f"Received query: {user_query}")
-
-    # --- Process Uploaded File ---
     uploaded_doc_text = ""
     file_info = data.get("file")
     tmp_path = None
@@ -249,63 +246,91 @@ async def run_llm_logic(sid, data: dict):
                     os.remove(tmp_path)
                 except Exception as cleanup_error:
                     log_debug(f"Could not remove temp file: {cleanup_error}")
-    # ----------------------------------
-    
-    # 0. Get history and condense the question
+    # 0. Get history
     history_obj = get_session_history(sid)
     chat_history = history_obj.messages
 
+    
+    # ------------------ CONDENSE ------------------
     if chat_history:
+        start = time.perf_counter()
+
         condensed_result = await condense_chain.ainvoke({
-            "question": user_query,     
+            "question": user_query,
             settings.HISTORY_DIR: chat_history,
         })
+
+        condense_time = (time.perf_counter() - start) * 1000
+
+        # Process condensed result ONLY here
         if isinstance(condensed_result, dict):
-            standalone_question = condensed_result.get("retrieval_queries", [user_query])   # safety net
+            standalone_question = condensed_result.get("retrieval_queries", [user_query])
             generation_question = condensed_result.get("generation_question", user_query)
         elif isinstance(condensed_result, list):
             standalone_question = condensed_result
-            generation_question = " and " .join(condensed_result)
+            generation_question = " and ".join(condensed_result)
         else:
             standalone_question = [user_query]
             generation_question = user_query
+
     else:
-        standalone_question = [user_query] 
+        standalone_question = [user_query]
         generation_question = user_query
+        condense_time = 0
+
+    log_timing(f"[LATENCY] Condense: {condense_time:.2f} ms")
+
         
     log_debug(f"Standalone question: {standalone_question}")
     log_debug(f"Generation question: {generation_question}")
-    
-    # 1. Retrieval
-    # --- NEW: Extract target files for filtering ---
     target_files = data.get("target_files", [])
     if target_files:
         log_debug(f"Targeting specific files: {target_files}")
-    
+        
+    start = time.perf_counter()
     # 1. Retrieval (UPDATE THIS LINE)
     retrieval_tasks = [retriever.ainvoke(q, target_sources=target_files) for q in standalone_question]
+    # 1. Retrieval    retrieval_tasks = [retriever.ainvoke(q) for q in standalone_question]
+
     results = await asyncio.gather(*retrieval_tasks)
+
+    retrieval_time = (time.perf_counter() - start) * 1000
+    log_timing(f"[LATENCY] Retrieval: {retrieval_time:.2f} ms")
+
+    # ------------------ DEDUP ------------------
+    start = time.perf_counter()
+
     unique_docs_map = {}
     for doc_list in results:
         for doc in doc_list:
             if doc.page_content not in unique_docs_map:
                 unique_docs_map[doc.page_content] = doc
-                
+
     retrieved_docs = list(unique_docs_map.values())
+
+    dedup_time = (time.perf_counter() - start) * 1000
+    log_timing(f"[LATENCY] Dedup: {dedup_time:.2f} ms")
+
     log_debug(f"Total Unique Retrieved Docs: {len(retrieved_docs)}")
+
+    # ------------------ FORMAT DOCS (OPTIONAL BUT SMART) ------------------
+    start = time.perf_counter()
+
     context, citation = format_documents(retrieved_docs)
+
+    format_time = (time.perf_counter() - start) * 1000
+    log_timing(f"[LATENCY] Format Docs: {format_time:.2f} ms")
+
     
     if not context:
         context = "No relevant documents found in the knowledge base."
-        citation=[]
-        
-    preview_context = context[:500] + "..." if len(context) > 500 else context
+        citation = []
+
     with open("chunk.txt", "w", encoding="utf-8") as f:
         f.write(context)
         
-    log_debug(f"Context Preview: {preview_context}")
+    log_debug(f"Context Preview: {context[:800]}")
     log_debug(f"Context Length: {len(context)} chars")
-    
     # 2. Streaming Response
     full_response = ""
     final_prompt_preview = f"""
@@ -330,7 +355,8 @@ async def run_llm_logic(sid, data: dict):
 
     # Initialize final_citations to empty list BEFORE try block
     final_citations = []
-    
+    llm_time = 0
+    start = time.perf_counter()
     try:
         async for chunk in chain_with_history.astream(
             {
@@ -346,7 +372,10 @@ async def run_llm_logic(sid, data: dict):
             if chunk_text:
                 await sio.emit("chat_stream_chunk", {"chunk": chunk_text}, to=sid)
 
-        # Signal completion - extract citations from response
+        llm_time = (time.perf_counter() - start) * 1000
+        log_timing(f"[LATENCY] LLM: {llm_time:.2f} ms")
+
+        # -------- Citation Extraction --------
         try:
             used_ids_matches = re.findall(r'[\[【](\d+)[\]】]', full_response)
             used_ids = set()
@@ -374,8 +403,18 @@ async def run_llm_logic(sid, data: dict):
         log_debug(f"Error during streaming: {e}")
         log_debug(f"Error type: {type(e).__name__}")
         import traceback
-        log_debug(f"Traceback: {traceback.format_exc()}")
-        await sio.emit("error", {"message": f"Stream error: {str(e)}"}, to=sid)
+        log_debug(traceback.format_exc())
+
+        await sio.emit("error", {"message": str(e)}, to=sid)
+
+    # ------------------ SUMMARY ------------------
+    log_timing(
+        f"[SUMMARY] condense={condense_time:.0f}ms | "
+        f"retrieval={retrieval_time:.0f}ms | "
+        f"dedup={dedup_time:.0f}ms | "
+        f"format={format_time:.0f}ms | "
+        f"llm={llm_time:.0f}ms"
+    )
 
 @sio.on("stop_generation")
 async def handle_stop_generation(sid):
