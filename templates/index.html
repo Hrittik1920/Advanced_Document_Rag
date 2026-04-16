@@ -223,6 +223,115 @@
             transition: all 0.2s;
         }
         .mention-pill-close:hover { opacity: 1; color: #dc3545; transform: scale(1.1); }
+        /* --- SENT MENTION TAGS --- */
+        .sent-tags-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            justify-content: flex-end;
+            width: 100%;
+            margin-bottom: -4px; /* Pulls text bubble slightly closer */
+        }
+        .sent-tag {
+            background-color: var(--accent-soft);
+            color: var(--header-bg);
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            border: 1px solid rgba(0, 150, 136, 0.2);
+            display: inline-flex;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        }
+        .sent-tag::before {
+            content: '@';
+            opacity: 0.7;
+            margin-right: 2px;
+        }
+        /* --- UPDATED FILE ATTACHMENT CARD STYLES --- */
+        .file-indicator-card {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 14px;
+            background-color: var(--chat-container-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 4px 12px var(--shadow-color);
+            margin-bottom: 12px;
+            width: fit-content;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+
+        /* Modern hover effect for the whole card */
+        .file-indicator-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 24px rgba(0, 150, 136, 0.15);
+            border-color: rgba(0, 150, 136, 0.4);
+        }
+
+        .file-indicator-icon, .sent-file-icon {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: var(--accent-soft);
+            color: var(--header-bg);
+            padding: 8px;
+            border-radius: 8px;
+            transition: background-color 0.3s;
+        }
+
+        .file-indicator-card:hover .file-indicator-icon {
+            background-color: rgba(0, 150, 136, 0.15);
+        }
+
+        .file-indicator-name, .sent-file-name {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #333;
+            max-width: 200px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: color 0.2s;
+        }
+
+        .file-indicator-card:hover .file-indicator-name {
+            color: var(--header-bg);
+        }
+
+        .file-indicator-close {
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: #9ca3af;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px;
+            border-radius: 50%;
+            transition: all 0.2s;
+            position: relative;
+            z-index: 2; /* Ensures clicking 'X' doesn't just trigger the preview */
+        }
+
+        .file-indicator-close:hover {
+            background-color: #fee2e2;
+            color: #ef4444;
+        }
+        .sent-file-card {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 14px;
+            background-color: #ffffff;
+            border: 1px solid var(--border-color);
+            border-radius: 16px 16px 4px 16px;
+            box-shadow: 0 4px 12px rgba(0, 150, 136, 0.15);
+            align-self: flex-end;
+        }
     </style>
 </head>
 <body>
@@ -238,9 +347,14 @@
         
         <footer class="chat-input-area">
             <div id="mention-dropdown" class="mention-dropdown"></div>
-            <div id="file-indicator" style="display: none; padding: 8px 14px; background: var(--accent-soft); border-radius: 8px; font-size: 0.85rem; margin-bottom: 12px; color: var(--header-bg); font-weight: 600; width: fit-content; align-items: center; gap: 10px;">
-                <span id="file-name-display"></span>
-                <button type="button" id="remove-file-btn" style="background: none; border: none; cursor: pointer; color: #dc3545; font-size: 1.2rem; line-height: 1; padding: 0;">&times;</button>
+            <div id="file-indicator" class="file-indicator-card" style="display: none;">
+                <div class="file-indicator-icon">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                </div>
+                <span id="file-name-display" class="file-indicator-name"></span>
+                <button type="button" id="remove-file-btn" class="file-indicator-close">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
             </div>
 
             <div id="selected-tags-container" class="selected-tags-container"></div>
@@ -390,7 +504,7 @@
             fileInput.addEventListener("change", (e) => {
                 if (e.target.files.length > 0) {
                     attachedFile = e.target.files[0];
-                    fileNameDisplay.textContent = "📎 " + attachedFile.name;
+                    fileNameDisplay.textContent = attachedFile.name;
                     fileIndicator.style.display = "flex";
                 }
             });
@@ -401,6 +515,144 @@
                 fileIndicator.style.display = "none";
             });
             // ------------------------------------------
+
+            // --- NEW: LOCAL PREVIEW LOGIC ---
+            fileIndicator.addEventListener("click", (e) => {
+                // Prevent opening preview if they clicked the 'X' button
+                if (e.target.closest('#remove-file-btn')) return; 
+                
+                if (attachedFile) {
+                    previewLocalFile(attachedFile);
+                }
+            });
+
+            function previewLocalFile(file) {
+                // Create a temporary local URL for the file
+                const fileURL = URL.createObjectURL(file);
+                
+                const modal = document.createElement("div");
+                modal.className = "doc-modal-overlay";
+                modal.style.zIndex = "2000"; // Ensure it's on top
+
+                let contentHtml = '';
+                if (file.type.startsWith('image/')) {
+                    contentHtml = `<img src="${fileURL}" style="max-width: 100%; max-height: 70vh; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);" />`;
+                } else if (file.type === 'application/pdf') {
+                    // #toolbar=0 removes the dark browser UI. view=FitH fits it nicely to the width.
+                    contentHtml = `<iframe src="${fileURL}#toolbar=0&navpanes=0&scrollbar=0&view=FitH" style="width: 100%; height: 75vh; border: none; border-radius: 8px; background: white; box-shadow: 0 4px 16px rgba(0,0,0,0.08);"></iframe>`;
+                } else {
+                    contentHtml = `<div style="padding: 40px; text-align: center; color: #666; font-weight: 500;">Preview not available for this file type (${file.name}).</div>`;
+                }
+
+                modal.innerHTML = `
+                    <div class="doc-modal-box" style="width: min(900px, 95vw);">
+                        <div class="doc-modal-header">
+                            <span class="doc-modal-title" style="display:flex; align-items:center; gap:8px;">
+                                <svg viewBox="0 0 24 24" width="18" height="18" fill="var(--header-bg)"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                                File Preview: ${file.name}
+                            </span>
+                            <button class="doc-modal-close" title="Close">&times;</button>
+                        </div>
+                        <div class="doc-modal-body" style="display: flex; flex-direction: column; align-items: center; justify-content: center; background: #f3f4f6; padding: 20px;">
+                            ${contentHtml}
+                        </div>
+                    </div>
+                `;
+
+                document.body.appendChild(modal);
+
+                const closeModal = () => {
+                    modal.remove();
+                    URL.revokeObjectURL(fileURL); // Free up browser memory!
+                };
+
+                modal.querySelector('.doc-modal-close').addEventListener('click', closeModal);
+                modal.addEventListener('click', (e) => {
+                    if (e.target === modal) closeModal();
+                });
+                
+                // Add Escape key to close this specific modal
+                document.addEventListener("keydown", function escHandler(e) {
+                    if (e.key === "Escape") { 
+                        closeModal(); 
+                        document.removeEventListener("keydown", escHandler); 
+                    }
+                });
+            }
+            // ------------------------------------------
+
+            function appendUserMessage(text, fileName, mentions) {
+                const wrapper = document.createElement("div"); 
+                wrapper.className = "message-wrapper user-wrapper";
+                
+                const contentCol = document.createElement("div");
+                contentCol.style.display = "flex";
+                contentCol.style.flexDirection = "column";
+                contentCol.style.alignItems = "flex-end";
+                contentCol.style.gap = "8px";
+                contentCol.style.maxWidth = "75%";
+
+                // 1. Render the separate File Card if a file exists
+                if (fileName) {
+                    const fileCard = document.createElement("div");
+                    fileCard.className = "sent-file-card";
+                    fileCard.innerHTML = `
+                        <div class="sent-file-icon">
+                            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                        </div>
+                        <div class="sent-file-name">${fileName}</div>
+                    `;
+                    contentCol.appendChild(fileCard);
+                }
+
+                // 2. Render Mentions as Visual Tags (Not text)
+                if (mentions && mentions.length > 0) {
+                    const tagsContainer = document.createElement("div");
+                    tagsContainer.className = "sent-tags-container";
+                    
+                    mentions.forEach(mention => {
+                        const tag = document.createElement("span");
+                        tag.className = "sent-tag";
+                        tag.textContent = mention;
+                        tagsContainer.appendChild(tag);
+                    });
+                    
+                    contentCol.appendChild(tagsContainer);
+                }
+
+                // 3. Render the text bubble and copy button ONLY if prompt text exists
+                const cleanText = text ? text.trim() : "";
+                
+                if (cleanText) {
+                    const textRow = document.createElement("div");
+                    textRow.style.display = "flex";
+                    textRow.style.flexDirection = "row";
+                    textRow.style.alignItems = "flex-start";
+                    
+                    // Create the Copy Button
+                    const copyBtn = document.createElement("button"); 
+                    copyBtn.className = "copy-btn"; 
+                    copyBtn.setAttribute("aria-label", "Copy message"); 
+                    copyBtn.innerHTML = `<svg class="copy-icon-svg" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>`;
+                    
+                    // THIS IS THE FIX: Only copy the clean text, ignoring files/mentions
+                    copyBtn.onclick = () => copyToClipboard(cleanText, copyBtn);
+
+                    const msgBubble = document.createElement("div"); 
+                    msgBubble.classList.add("message", "user-message"); 
+                    msgBubble.style.maxWidth = "100%"; 
+                    msgBubble.style.marginTop = "0px";
+                    msgBubble.textContent = cleanText;
+                    
+                    textRow.appendChild(copyBtn);
+                    textRow.appendChild(msgBubble);
+                    contentCol.appendChild(textRow);
+                }
+                
+                wrapper.append(contentCol); 
+                chatBox.appendChild(wrapper);
+                scrollToBottom();
+            }
 
             // Connect Socket (Adjust if backend is on different URL)
             const socket = io(window.location.origin);
@@ -467,12 +719,7 @@
                 isRequestInProgress = true; toggleButtonState(true);
                 
                 // Construct the user display message showing their tags and file uploads
-                let displayMsg = "";
-                if (attachedFile) displayMsg += `[Uploaded: ${attachedFile.name}]\n`;
-                if (selectedMentions.length > 0) displayMsg += `[Searching in: ${selectedMentions.join(", ")}]\n`;
-                displayMsg += text;
-                
-                appendMessage(displayMsg.trim(), "user-message");
+                appendUserMessage(text, attachedFile ? attachedFile.name : null, selectedMentions);
                 
                 userInput.value = ""; userInput.style.height = '54px'; 
                 showLoadingIndicator();

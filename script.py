@@ -83,6 +83,30 @@ prompt = ChatPromptTemplate.from_messages([
     ("human", "{question}"),
 ])
 
+# --- Router Logic (For targeting uploaded files) ---
+router_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a highly strict document classification API.\n"
+               "Task: Match the uploaded document snippet to the correct file(s) from the AVAILABLE FILES list.\n\n"
+               "### MATCHING RULES (Universal for any State/Location):\n"
+               "1. Exact Regional Match (Preferred): Look for specific regional keywords in the company name (e.g., 'Poorv' = East, 'Madhya' = Central, 'Dakshin' = South, 'Paschim' = West). If you are 100% sure which specific regional file matches the document, return ONLY that file.\n"
+               "2. State-Level Fallback (When in doubt): If you identify the State (e.g., 'Madhya Pradesh' -> 'mp', 'Uttar Pradesh' -> 'up', 'Maharashtra' -> 'mh') but the specific region is unclear, missing, or you have any doubt, play it safe and return ALL files from that state.\n"
+               "3. Generalization: Apply this logic to any geographical indicator found in the text.\n\n"
+               "AVAILABLE FILES: {available_files}\n\n"
+               "You must respond ONLY with a raw JSON object. Do NOT wrap it in markdown blockquotes (```json). Do NOT add any conversational text.\n\n"
+               "Expected Exact Format:\n"
+               "{{\n"
+               "  \"target_files\": [\"matched_filename1.pdf\", \"matched_filename2.pdf\"]\n"
+               "}}\n\n"
+               "If no match is found, return {{\"target_files\": []}}."),
+    ("human", "User Query: {question}\n\nUploaded Document Snippet:\n{uploaded_text}")
+])
+
+# Removed format="json" to prevent empty output stalls in Ollama
+router_model = OllamaLLM(model=settings.LLM_MODEL_NAME, temperature=0)
+
+# Build the complete chain
+router_chain = router_prompt | router_model | JsonOutputParser()
+
 # --- Helper to format documents ---
 def format_documents(docs: list) -> str:
     """
