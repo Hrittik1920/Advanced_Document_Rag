@@ -21,7 +21,7 @@ import io
 import tempfile
 from data_loader import MultiFormatDocumentLoader
 warnings.filterwarnings("ignore", category=FutureWarning)
-from script import format_documents, original_chain, condense_chain
+from script import format_documents, original_chain, condense_chain, router_chain
 
 from datetime import datetime
 
@@ -284,11 +284,41 @@ async def run_llm_logic(sid, data: dict):
     log_debug(f"Standalone question: {standalone_question}")
     log_debug(f"Generation question: {generation_question}")
     target_files = data.get("target_files", [])
+    
+    # --- NEW ROUTER LOGIC FOR UPLOADED FILES ---
+    if uploaded_doc_text and not target_files:
+        start_router = time.perf_counter()
+        log_debug("Uploaded document detected. Running Router LLM to determine target files...")
+        try:
+            available_files = []
+            if os.path.exists(settings.DOCUMENTS_DIR):
+                available_files = [f for f in os.listdir(settings.DOCUMENTS_DIR) if f.endswith(".pdf") or f.endswith(".docx")]
+            
+            # The chain is imported from script.py, we just invoke it here
+            llm_target_files = await router_chain.ainvoke({
+                "question": user_query,
+                "uploaded_text": uploaded_doc_text[:2000],
+                "available_files": available_files
+            })
+            
+            # --- UPDATE THESE TWO LINES ---
+            if isinstance(llm_target_files, dict):
+                target_files = [f for f in llm_target_files.get("target_files", []) if f in available_files]
+            # ------------------------------
+                
+            router_time = (time.perf_counter() - start_router) * 1000
+            log_timing(f"[LATENCY] Router LLM: {router_time:.2f} ms")
+            log_debug(f"Router selected valid files: {target_files}")
+            
+        except Exception as e:
+            log_debug(f"⚠️ Router LLM failed, falling back to all files. Error: {e}")
+    # -------------------------------------------
+
     if target_files:
-        log_debug(f"Targeting specific files: {target_files}")
+        log_debug(f"Final targeting specific files: {target_files}")
         
     start = time.perf_counter()
-    # 1. Retrieval (UPDATE THIS LINE)
+    # 1. Retrieval
     retrieval_tasks = [retriever.ainvoke(q, target_sources=target_files) for q in standalone_question]
     # 1. Retrieval    retrieval_tasks = [retriever.ainvoke(q) for q in standalone_question]
 
