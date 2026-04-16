@@ -283,6 +283,7 @@ async def run_llm_logic(sid, data: dict):
         
     log_debug(f"Standalone question: {standalone_question}")
     log_debug(f"Generation question: {generation_question}")
+
     target_files = data.get("target_files", [])
     
     # --- NEW ROUTER LOGIC FOR UPLOADED FILES ---
@@ -337,11 +338,45 @@ async def run_llm_logic(sid, data: dict):
                 unique_docs_map[doc.page_content] = doc
 
     retrieved_docs = list(unique_docs_map.values())
+    is_weak_retrieval = len(retrieved_docs) < 5
 
     dedup_time = (time.perf_counter() - start) * 1000
     log_timing(f"[LATENCY] Dedup: {dedup_time:.2f} ms")
 
     log_debug(f"Total Unique Retrieved Docs: {len(retrieved_docs)}")
+
+    # ------------------ HYDE FALLBACK ------------------
+    if is_weak_retrieval and len(generation_question.split()) > 3:
+        log_debug("[HYDE] Weak retrieval detected, retrying with HYDE...")
+
+        from script import generate_hyde_query
+
+        try:
+            hyde_query = generate_hyde_query(generation_question)
+
+            hyde_results = await retriever.ainvoke(
+                hyde_query,
+                target_sources=target_files
+            )
+
+            # 🔥 merge HYDE results
+            for doc in hyde_results:
+                if doc.page_content not in unique_docs_map:
+                    unique_docs_map[doc.page_content] = doc
+
+            retrieved_docs = list(unique_docs_map.values())
+
+            log_debug(f"[HYDE] Retrieved {len(retrieved_docs)} docs after retry")
+
+            # 🔥 DEBUG safety
+            if len(retrieved_docs) < 5:
+                log_debug("[HYDE] Still weak after retry")
+
+        except Exception as e:
+            log_debug(f"[HYDE ERROR] {e}")
+
+    # 🔥 LIMIT BEFORE RERANK (CRITICAL)
+    retrieved_docs = retrieved_docs[:20]
 
     # ------------------ FORMAT DOCS (OPTIONAL BUT SMART) ------------------
     start = time.perf_counter()
