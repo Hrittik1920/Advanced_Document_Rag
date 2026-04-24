@@ -3,12 +3,14 @@ import base64
 import aiohttp
 from typing import AsyncGenerator
 import json
+from config import settings
+
 async def query_ollama(
     prompt: str, 
     model: str, 
     image_path: str = None, 
     keep_alive: int = 0,
-    base_url: str = "http://localhost:11434",
+    base_url: str = None,
     num_ctx_tokens: int = 4192,
     stream: bool = True
 ) -> AsyncGenerator[str, None]:
@@ -16,14 +18,15 @@ async def query_ollama(
     Asynchronously queries an Ollama Vision Language Model (VLM) with streaming support.
     Yields response chunks as they arrive.
     """
-    url = f"{base_url}/api/generate"
+    resolved_base_url = (base_url or settings.LLM_ENDPOINT).rstrip("/")
+    url = f"{resolved_base_url}/api/generate"
     
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": stream,
         "keep_alive": f"{keep_alive}m", # Ollama accepts '0m', '5m', etc.
-        "num_ctx_tokens": num_ctx_tokens
+        "options": {"num_ctx": num_ctx_tokens},
     }
     
     # Safely handle the image if provided
@@ -42,17 +45,21 @@ async def query_ollama(
             async with session.post(url, json=payload) as response:
                 if response.status == 200:
                     if stream:
-                        buffer=""
+                        buffer = ""
                         # Stream mode: yield chunks as they arrive
-                        async for line in response.content.iter_chunked(1024):
-                            for chunk_line in line.decode('utf-8').split('\n'):
-                                if chunk_line.strip():
-                                    try:
-                                        data = json.loads(chunk_line)
-                                        if 'response' in data:
-                                            yield data['response']
-                                    except json.JSONDecodeError:
-                                        continue
+                        async for data_bytes in response.content.iter_any():
+                            buffer += data_bytes.decode("utf-8")
+                            while "\n" in buffer:
+                                chunk_line, buffer = buffer.split("\n", 1)
+                                chunk_line = chunk_line.strip()
+                                if not chunk_line:
+                                    continue
+                                try:
+                                    data = json.loads(chunk_line)
+                                except json.JSONDecodeError:
+                                    continue
+                                if "response" in data:
+                                    yield data["response"]
                         if buffer.strip():
                             try:
                                 data = json.loads(buffer)
@@ -69,7 +76,7 @@ async def query_ollama(
                     print(f"⚠️ Ollama API Error {response.status}: {error_text}")
                     yield ""
     except aiohttp.ClientConnectorError:
-        print(f"❌ Failed to connect to Ollama. Is it running at {base_url}?")
+        print(f"❌ Failed to connect to Ollama. Is it running at {resolved_base_url}?")
         yield ""
     except Exception as e:
         print(f"❌ Unexpected error querying Ollama: {e}")

@@ -35,16 +35,17 @@ FILE_HASH_DB        = os.path.join(DB_LOCATION, "file_hashes.json")
 BM25_INDEX_FILE     = os.path.join(DB_LOCATION, "bm25_index.pkl")
 COLLECTION_NAME     = "multi_format_documents"
 
-EMBEDDINGS      = OllamaEmbeddings(model=settings.LLM_EMBEDDING_MODEL)
+EMBEDDING_BASE_URL = settings.LLM_ENDPOINT
+DEFAULT_OLLAMA_ENDPOINT = "http://localhost:11434"
 RERANKER_MODEL  = settings.CROSS_ENCODER_MODEL
 
 # Stage 1 — how many candidates each retriever returns before fusion on the basis of thresholds
-BM25_SCORE_RATIO   = 0.7
+BM25_SCORE_RATIO   = 0.4
 VECTOR_SIMILARITY_THRESHOLD = 0.6
 GRAPH_SCORE_THRESHOLD  = 0.3      # ← new
 # Stage 3 — final docs after reranking
 MAX_CANDIDATES_PER_RETRIEVER = 100
-DYNAMIC_DROP_OFF = 6.0 # drop anything that is this many points lower than the best doc's score
+DYNAMIC_DROP_OFF = 7.0 # drop anything that is this many points lower than the best doc's score
 FINAL_TOP_K = 30
 
 
@@ -120,6 +121,46 @@ def save_bm25_index(data: dict):
     os.makedirs(DB_LOCATION, exist_ok=True)
     with open(BM25_INDEX_FILE, "wb") as f:
         pickle.dump(data, f)
+
+
+def _embedding_endpoint_candidates() -> list[str | None]:
+    candidates: list[str | None] = []
+
+    configured = (EMBEDDING_BASE_URL or "").strip()
+    if configured:
+        candidates.append(configured.rstrip("/"))
+
+    if DEFAULT_OLLAMA_ENDPOINT not in candidates:
+        candidates.append(DEFAULT_OLLAMA_ENDPOINT)
+
+    # Let OllamaEmbeddings use its internal default as the final fallback.
+    candidates.append(None)
+    return candidates
+
+
+def _build_embeddings_with_fallback() -> tuple[OllamaEmbeddings, int]:
+    last_error: Exception | None = None
+
+    for base_url in _embedding_endpoint_candidates():
+        label = base_url or "library default"
+        try:
+            kwargs = {"model": settings.LLM_EMBEDDING_MODEL}
+            if base_url:
+                kwargs["base_url"] = base_url
+
+            embeddings = OllamaEmbeddings(**kwargs)
+            size = len(embeddings.embed_query("test"))
+            print(f"Using Ollama embeddings endpoint: {label}")
+            print(f"Embedding dimension detected: {size}")
+            return embeddings, size
+        except Exception as exc:
+            last_error = exc
+            print(f"Warning: embeddings endpoint failed ({label}): {exc}")
+
+    raise ConnectionError(
+        "Could not connect to any Ollama embeddings endpoint. "
+        f"Tried configured endpoint '{EMBEDDING_BASE_URL}' and local default '{DEFAULT_OLLAMA_ENDPOINT}'."
+    ) from last_error
 # ─────────────────────────────────────────────
 # Hybrid Retriever
 # ─────────────────────────────────────────────
@@ -253,7 +294,8 @@ class HybridRetriever:
             score = min(float(score), 1.0)
             content = r.page_content.strip()
 
-            if score < self.vector_similarity_threshold: continue
+            if len(valid_docs) >= 15 and score < self.vector_similarity_threshold: 
+                continue
             if len(content) < 15: continue
             if self._GARBAGE_RE.match(content): continue
             if content.count('\n') > len(content) * 0.4: continue
@@ -394,8 +436,7 @@ def initialize_retriever() -> HybridRetriever:
 
     # ── Qdrant setup (unchanged) ──────────────────────────────────────────────
     client = QdrantClient(url=QDRANT_URL)
-    size = len(EMBEDDINGS.embed_query("test"))
-    print(f"Embedding dimension detected: {size}")
+    embeddings, size = _build_embeddings_with_fallback()
 
     try:
         collections = client.get_collections().collections
@@ -413,7 +454,7 @@ def initialize_retriever() -> HybridRetriever:
         vector_store = QdrantVectorStore(
             client=client,
             collection_name=COLLECTION_NAME,
-            embedding=EMBEDDINGS,
+            embedding=embeddings,
         )
     except Exception as e:
         print(f"Critical error: Could not initialize QdrantVectorStore: {e}")

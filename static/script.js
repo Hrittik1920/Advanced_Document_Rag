@@ -127,10 +127,8 @@ document.addEventListener("DOMContentLoaded", () => {
     // --- Event listener for potential server errors ---
     socket.on("error", (data) => {
         console.error("Server Error:", data.message);
-        hideLoadingIndicator();
         appendMessage(`Sorry, an error occurred: ${data.message}`, "bot-message");
-        isRequestInProgress = false;
-        sendButton.disabled = false;
+        resetInputState();
     });
 
     // --- Function to handle sending a message ---
@@ -245,9 +243,15 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function resetInputState() {
+        hideLoadingIndicator();
+        isRequestInProgress = false;
+        sendButton.disabled = false;
+        userInput.focus();
+    }
+
     function scrollToBottom() {
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 });
-
 
