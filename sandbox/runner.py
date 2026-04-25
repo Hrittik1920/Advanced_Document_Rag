@@ -7,7 +7,6 @@ import traceback
 from contextlib import redirect_stdout
 from fastapi import FastAPI
 from pydantic import BaseModel
-
 SAFE_BUILTINS = {
     "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
     "range": range, "round": round, "int": int, "float": float, "str": str,
@@ -45,6 +44,10 @@ app = FastAPI()
 
 class CodePayload(BaseModel):
     code: str
+    
+@app.post("/")
+async def connection():
+    return{"sandbox":"is reachable"}
 
 @app.post("/run")
 async def execute_code(payload: CodePayload):
