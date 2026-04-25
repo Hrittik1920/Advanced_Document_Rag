@@ -13,7 +13,7 @@ async def run_code_in_sandbox(code: str) -> str:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://localhost:9999/run", 
+                "http://sandbox:9999/run", 
                 json={"code": code},
                 timeout=10 # Prevent infinite loops from locking the agent
             ) as response:

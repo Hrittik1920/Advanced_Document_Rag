@@ -127,7 +127,7 @@ class AgentNodes:
 
                 hyde_results = await self.retriever.ainvoke(
                     hyde_query,
-                    target_sources=target_files if target_files else None
+                    target_sources=combined_target_files if combined_target_files else None
                 )
 
                 log_debug(f"[HYDE] Retrieval returned {len(hyde_results)} docs")

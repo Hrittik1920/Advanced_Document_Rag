@@ -19,7 +19,7 @@ from tqdm import tqdm
 import uuid
 import concurrent.futures
 
-from data_loader import MultiFormatDocumentLoader, dump_chunks_to_file
+from extraction import MultiFormatDocumentLoader, dump_chunks_to_file
 from config import settings
 from .knowledge_graph import build_graph_retriever, GraphRetriever   # ← new
 

@@ -19,7 +19,7 @@ import warnings
 import sys
 import io
 import tempfile
-from data_loader import MultiFormatDocumentLoader
+from extraction import MultiFormatDocumentLoader, SuryaLayoutExtractor
 warnings.filterwarnings("ignore", category=FutureWarning)
 from script import format_documents, original_chain, condense_chain, router_chain
 import os 
@@ -216,13 +216,19 @@ async def run_llm_logic(sid, data: dict):
                 thread_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(thread_loop)
                 try:
-                    loader = MultiFormatDocumentLoader()
-                    return loader.load_document(tmp_path)
+                    
+                    with SuryaLayoutExtractor() as loader:
+                        return loader.extract(tmp_path)
                 finally:
                     thread_loop.close()
                 
             docs = await asyncio.to_thread(process_uploaded_file)
-            uploaded_doc_text = "\n\n".join([d.page_content for d in docs])
+            if isinstance(docs, str):
+                uploaded_doc_text=docs
+            elif isinstance(docs, list):
+                uploaded_doc_text = "\n\n".join([d.page_content for d in docs])
+            else:
+                uploaded_doc_text=str(docs)
             log_debug(f"Extracted {len(uploaded_doc_text)} chars from uploaded document.")
             
         except Exception as e:
