@@ -21,3 +21,4 @@ hybrid_db/
 improvement.md
 .pytest_cache/
 .ruff_cache/
+TestAnswerLog/

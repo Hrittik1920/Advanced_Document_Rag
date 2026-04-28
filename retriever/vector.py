@@ -18,8 +18,9 @@ from qdrant_client.http import models as rest
 from tqdm import tqdm
 import uuid
 import concurrent.futures
+from copy import copy
 
-from data_loader import MultiFormatDocumentLoader, dump_chunks_to_file
+from data_loader import MultiFormatDocumentLoader, dump_chunks_to_file, ENCODER 
 from config import settings
 from .knowledge_graph import build_graph_retriever, GraphRetriever   # ← new
 
@@ -47,8 +48,27 @@ GRAPH_SCORE_THRESHOLD  = 0.3      # ← new
 MAX_CANDIDATES_PER_RETRIEVER = 100
 DYNAMIC_DROP_OFF = 7.0 # drop anything that is this many points lower than the best doc's score
 FINAL_TOP_K = 30
+EMBED_HARD_LIMIT = 450
 
-
+# ADDED: last-resort safety net — catches any chunk that slipped through oversized
+def _safe_truncate_docs(docs: list, max_tokens: int = EMBED_HARD_LIMIT) -> list:
+    cleaned = []
+    for doc in docs:
+        text = doc.metadata.get("embed_content") or doc.page_content  # tables store embed text in embed_content
+        tokens = ENCODER.encode(text)
+        if len(tokens) > max_tokens:
+            print(
+                f"⚠️  Truncating oversized chunk from "
+                f"'{doc.metadata.get('source')}' "
+                f"({len(tokens)} → {max_tokens} tokens)"
+            )
+            text = ENCODER.decode(tokens[:max_tokens])  # slices at token boundary, not character boundary
+            doc = copy(doc)
+            doc.page_content = text
+            if "embed_content" in doc.metadata:
+                doc.metadata["embed_content"] = text
+        cleaned.append(doc)
+    return cleaned
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
@@ -428,11 +448,13 @@ def initialize_retriever() -> HybridRetriever:
     deleted = set(file_hashes.keys()) - current_files
     if deleted:
         print(f"Pruning chunks from {len(deleted)} deleted file(s)...")
-        deleted_chunk_ids = [corpus_doc_id(c) for c in corpus if c["metadata"].get("source") in deleted]
-        corpus = [c for c in corpus if c["metadata"].get("source") not in deleted]
+        deleted_basenames = {os.path.basename(f) for f in deleted}  # convert full paths to basenames to match metadata
+        deleted_chunk_ids = [corpus_doc_id(c) for c in corpus if c["metadata"].get("source") in deleted_basenames]  # collect BEFORE purging
+        corpus = [c for c in corpus if c["metadata"].get("source") not in deleted_basenames]
         existing_ids = {corpus_doc_id(c) for c in corpus}
         for fpath in deleted:
             del updated_hashes[fpath]
+
 
     # ── Qdrant setup (unchanged) ──────────────────────────────────────────────
     client = QdrantClient(url=QDRANT_URL)
@@ -497,6 +519,7 @@ def initialize_retriever() -> HybridRetriever:
                 )
                 for d in batch
             ]
+            embed_batch = _safe_truncate_docs(embed_batch)
             vector_store.add_documents(documents=embed_batch, ids=batch_ids)
 
         # Sparse: add original (unmodified) chunks to BM25 corpus

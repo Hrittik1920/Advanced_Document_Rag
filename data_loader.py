@@ -20,44 +20,60 @@ import uuid
 import fitz
 
 from llm_clients import query_ollama
+import tiktoken
 
-nest_asyncio.apply()
+ENCODER = tiktoken.get_encoding("cl100k_base")
+EMBED_MAX_TOKENS = 400 
+
+def count_tokens(text: str) -> int:
+    return len(ENCODER.encode(text))
+
+#---------------------------------------------------------------------------
 
 #  NEW: Context-Prefixed Markdown (The Token-Optimized Table Solution)
-def table_to_context_markdown(df: pd.DataFrame, source: str, section: str) -> str:
+def table_to_context_markdown(
+    df: pd.DataFrame,
+    source: str,
+    section: str,
+    max_tokens: int = EMBED_MAX_TOKENS,   # ADDED: token budget parameter
+    ) -> str:
     """
     Converts a dataframe chunk to a Markdown table and prepends a semantic context header.
     This solves the 'RAG Table Dilemma' by combining token-efficiency (Markdown)
     with high retrieval accuracy (Semantic Prefix mapping the columns).
     """
-    # Extract readable column names
     valid_columns = [str(c).strip() for c in df.columns if str(c).strip() and str(c).lower() != "nan"]
     columns_text = ", ".join(valid_columns) if valid_columns else "unnamed columns"
 
-    # The semantic prefix forces the embedding model to understand the 2D Markdown structure
+    # SHORTENED prefix: same semantic meaning, fewer tokens wasted on filler words
     prefix = (
-        f"This chunk contains structured tabular data from the document '{source}', "
-        f"located in the section '{section}'. "
-        f"The table maps data across the following columns: {columns_text}.\n\n"
+        f"Structured table from '{source}', section '{section}'. "
+        f"Columns: {columns_text}.\n\n"
     )
-    
-    # Generate the token-efficient Markdown
-    markdown_table = df.to_markdown(index=False)
-    
-    return prefix + markdown_table
 
+    prefix_tokens = len(ENCODER.encode(prefix))   # ADDED: measure how many tokens the prefix itself costs
+    budget = max_tokens - prefix_tokens            # ADDED: remaining tokens available for the actual table rows
+
+    # ADDED: try progressively fewer rows until the markdown fits within the token budget
+    sample_md = df.head(min(5, len(df))).to_markdown(index=False) or ""
+    tokens_per_row = max(1, len(ENCODER.encode(sample_md)) / min(5, len(df)))
+    safe_rows = max(1, int(budget / tokens_per_row))
+    md = df.head(safe_rows).to_markdown(index=False)
+    return prefix + md
 # ---------------------------------------------------------------------------
 class SemanticAwareTextSplitter:
     """
     Splits text into chunks that respect **semantic** (topic-shift) boundaries
     rather than fixed character counts.
     """
-    MIN_CHUNK_CHARS:    int   = 400
-    BASE_CHUNK_CHARS:   int   = 1_200
-    MAX_CHUNK_CHARS:    int   = 2_000
+    # MIN_CHUNK_CHARS:    int   = 400
+    # BASE_CHUNK_CHARS:   int   = 1_200
+    # MAX_CHUNK_CHARS:    int   = 2_000
     BOUNDARY_THRESHOLD: float = 0.35   # Minimum cosine distance to be a boundary
     BRIDGE_SENTENCES:   int   = 1      # Sentences carried forward for context
-
+    MIN_TOKENS = 200
+    MAX_TOKENS = 500
+    OVERLAP_TOKENS = 50
     _ABBREV_RE = re.compile(
         r'\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|Fig|No|Vol|pp)\.\s',
         re.IGNORECASE,
@@ -78,23 +94,23 @@ class SemanticAwareTextSplitter:
         except ImportError:
             return False
 
-    def compute_target_size(self, text: str) -> int:
-        words = text.split()
-        if not words:
-            return self.BASE_CHUNK_CHARS
+    # def compute_target_size(self, text: str) -> int:
+    #     words = text.split()
+    #     if not words:
+    #         return self.BASE_CHUNK_CHARS
 
-        unique_ratio = len({w.lower() for w in words}) / len(words)
-        avg_word_len = sum(len(w) for w in words) / len(words)
+    #     unique_ratio = len({w.lower() for w in words}) / len(words)
+    #     avg_word_len = sum(len(w) for w in words) / len(words)
 
-        density = min(1.0,
-                      unique_ratio * 0.6
-                      + min(avg_word_len, 8) / 8 * 0.4)
+    #     density = min(1.0,
+    #                   unique_ratio * 0.6
+    #                   + min(avg_word_len, 8) / 8 * 0.4)
 
-        target = int(
-            self.MAX_CHUNK_CHARS
-            - density * (self.MAX_CHUNK_CHARS - self.MIN_CHUNK_CHARS)
-        )
-        return max(self.MIN_CHUNK_CHARS, min(self.MAX_CHUNK_CHARS, target))
+    #     target = int(
+    #         self.MAX_CHUNK_CHARS
+    #         - density * (self.MAX_CHUNK_CHARS - self.MIN_CHUNK_CHARS)
+    #     )
+    #     return max(self.MIN_CHUNK_CHARS, min(self.MAX_CHUNK_CHARS, target))
 
     def tokenize_sentences(self, text: str) -> list[str]:
         protected = self._ABBREV_RE.sub(
@@ -114,87 +130,97 @@ class SemanticAwareTextSplitter:
 
         return sentences or [text.strip()]
 
-    def _pairwise_distances(self, sentences: list[str]) -> list[float]:
-        if len(sentences) < 2:
-            return []
+    # def _pairwise_distances(self, sentences: list[str]) -> list[float]:
+    #     if len(sentences) < 2:
+    #         return []
 
-        if self._has_sklearn:
-            try:
-                vec = self._TfidfVectorizer(
-                    analyzer="char_wb", ngram_range=(3, 5), min_df=1
-                )
-                matrix = vec.fit_transform(sentences)
-                return [
-                    1.0 - float(
-                        self._cosine_similarity(matrix[i], matrix[i + 1])[0][0]
-                    )
-                    for i in range(len(sentences) - 1)
-                ]
-            except Exception:
-                pass  # Fall through to Jaccard
+    #     if self._has_sklearn:
+    #         try:
+    #             vec = self._TfidfVectorizer(
+    #                 analyzer="char_wb", ngram_range=(3, 5), min_df=1
+    #             )
+    #             matrix = vec.fit_transform(sentences)
+    #             return [
+    #                 1.0 - float(
+    #                     self._cosine_similarity(matrix[i], matrix[i + 1])[0][0]
+    #                 )
+    #                 for i in range(len(sentences) - 1)
+    #             ]
+    #         except Exception:
+    #             pass  # Fall through to Jaccard
 
-        def _jaccard(a: str, b: str) -> float:
-            sa, sb = set(a.lower().split()), set(b.lower().split())
-            if not sa and not sb:
-                return 0.0
-            return 1.0 - len(sa & sb) / len(sa | sb)
+    #     def _jaccard(a: str, b: str) -> float:
+    #         sa, sb = set(a.lower().split()), set(b.lower().split())
+    #         if not sa and not sb:
+    #             return 0.0
+    #         return 1.0 - len(sa & sb) / len(sa | sb)
 
-        return [_jaccard(sentences[i], sentences[i + 1])
-                for i in range(len(sentences) - 1)]
+    #     return [_jaccard(sentences[i], sentences[i + 1])
+    #             for i in range(len(sentences) - 1)]
 
-    def find_semantic_boundaries(self, sentences: list[str]) -> set[int]:
-        distances = self._pairwise_distances(sentences)
-        if not distances:
-            return set()
+    # def find_semantic_boundaries(self, sentences: list[str]) -> set[int]:
+    #     distances = self._pairwise_distances(sentences)
+    #     if not distances:
+    #         return set()
 
-        arr = np.array(distances)
-        adaptive_threshold = max(
-            self.BOUNDARY_THRESHOLD,
-            float(arr.mean() + 0.5 * arr.std()),
-        )
+    #     arr = np.array(distances)
+    #     adaptive_threshold = max(
+    #         self.BOUNDARY_THRESHOLD,
+    #         float(arr.mean() + 0.5 * arr.std()),
+    #     )
 
-        boundaries: set[int] = set()
-        for i, d in enumerate(distances):
-            if d < adaptive_threshold:
-                continue
-            left  = distances[i - 1] if i > 0                   else -1.0
-            right = distances[i + 1] if i + 1 < len(distances)  else -1.0
-            if d >= left and d >= right:
-                boundaries.add(i + 1)
+    #     boundaries: set[int] = set()
+    #     for i, d in enumerate(distances):
+    #         if d < adaptive_threshold:
+    #             continue
+    #         left  = distances[i - 1] if i > 0                   else -1.0
+    #         right = distances[i + 1] if i + 1 < len(distances)  else -1.0
+    #         if d >= left and d >= right:
+    #             boundaries.add(i + 1)
 
-        return boundaries
+    #     return boundaries
 
     def split(self, text: str) -> list[str]:
         sentences = self.tokenize_sentences(text)
-        if len(sentences) <= 1:
-            return [text.strip()] if text.strip() else []
+        if not sentences:
+            return []
 
-        target_size  = self.compute_target_size(text)
-        boundaries   = self.find_semantic_boundaries(sentences)
+        chunks = []
+        current = []
+        current_tokens = 0
 
-        chunks:      list[str]  = []
-        current:     list[str]  = []
-        current_len: int        = 0
-        bridge:      list[str]  = []
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
 
-        for idx, sent in enumerate(sentences):
-            sent_len   = len(sent)
-            at_boundary = idx in boundaries
-            over_min    = current_len >= self.MIN_CHUNK_CHARS
-            would_exceed = (current_len + sent_len) > self.MAX_CHUNK_CHARS
+            sent_tokens = count_tokens(sent)
 
-            flush = current and (
-                (at_boundary and over_min) or would_exceed
-            )
+            # If exceeds → flush
+            if current_tokens + sent_tokens > self.MAX_TOKENS:
+                if current:
+                    chunks.append(" ".join(current))
 
-            if flush:
-                chunks.append(" ".join(current))
-                bridge  = current[-self.BRIDGE_SENTENCES:] if self.BRIDGE_SENTENCES else []
-                current = list(bridge)
-                current_len = sum(len(s) for s in current)
+                    # 🔁 Token overlap
+                    overlap = []
+                    overlap_tokens = 0
+
+                    for s in reversed(current):
+                        t = count_tokens(s)
+                        overlap.insert(0, s)
+                        overlap_tokens += t
+                        if overlap_tokens >= self.OVERLAP_TOKENS:
+                            break
+
+                    current = overlap
+                    current_tokens = overlap_tokens
+                else:
+                    # single long sentence
+                    chunks.append(sent)
+                    continue
 
             current.append(sent)
-            current_len += sent_len
+            current_tokens += sent_tokens
 
         if current:
             chunks.append(" ".join(current))
@@ -202,16 +228,16 @@ class SemanticAwareTextSplitter:
         return chunks
 
     @staticmethod
-    def dynamic_table_rows(df: "pd.DataFrame", target_chars: int = 1_000) -> int:
+    def dynamic_table_rows(df: "pd.DataFrame", target_tokens: int = 350) -> int:
         if df.empty:
-            return 30
-        sample = min(10, len(df))
+            return 20  # CHANGED: 30 → 20, safer default since we're now token-aware
+        sample = min(5, len(df))  # CHANGED: 10 → 5, 5 rows is enough to estimate tokens per row
         try:
-            sample_md  = df.head(sample).to_markdown(index=False) or ""
-            chars_per_row = max(1, len(sample_md) / sample)
-            rows = max(5, min(60, int(target_chars / chars_per_row)))
+            sample_md = df.head(sample).to_markdown(index=False) or ""
+            tokens_per_row = max(1, len(ENCODER.encode(sample_md)) / sample)  # CHANGED: len(sample_md) → len(ENCODER.encode(sample_md)), measures actual tokens not characters
+            rows = max(5, min(60, int(target_tokens / tokens_per_row)))  # CHANGED: target_chars → target_tokens, now dividing tokens by tokens per row which is consistent
         except Exception:
-            rows = 30
+            rows = 20  # CHANGED: 30 → 20, matches the safer default above
         return rows
 
 
@@ -253,50 +279,54 @@ class HeaderAwareTextSplitter:
         sections: list[tuple[str, str]],
         base_metadata: dict,
         is_table: bool = False,
-    ) -> list[Document]:
+        ) -> list[Document]:
         docs = []
+
         for header, body in sections:
             body = body.strip()
             if not body:
                 continue
 
-            meta = {**base_metadata, "section": header} if header else base_metadata.copy()
+            # ✅ metadata only (no content pollution)
+            meta = base_metadata.copy()
+            if header:
+                meta["section"] = header
             meta["is_table"] = is_table
-            contextualized_body = f"[{header}]\n{body}" if header else body
-            
+
+            # -------------------------
+            # ✅ TABLES (no prefix noise)
+            # -------------------------
             if is_table:
                 meta["chunk_id"] = self._generate_chunk_id(body, meta)
-                docs.append(Document(page_content=contextualized_body, metadata=meta))
-                continue
-            
-            target_size = self._semantic_splitter.compute_target_size(body)
 
-            if len(body) <= target_size:
-                meta["chunk_id"] = self._generate_chunk_id(body, meta)
-                docs.append(Document(page_content=contextualized_body, metadata=meta))
-            else:
-                sub_texts = self._semantic_splitter.split(body)
-
-                for idx, sub_text in enumerate(sub_texts):
-                    sub_text = sub_text.strip()
-                    if not sub_text:
-                        continue
-
-                    is_continuation = idx > 0
-                    if is_continuation and header:
-                        label   = f"[{header} — part {idx + 1} of {len(sub_texts)}]"
-                    elif header:
-                        label = f"[{header}]"
-                    else:
-                        label = None
-
-                    content = f"{label}\n{sub_text}" if label else sub_text
-                    sub_meta = {**meta}
-                    sub_meta["chunk_id"] = (
-                        f"{self._generate_chunk_id(sub_text, meta)}_{idx}"
+                docs.append(
+                    Document(
+                        page_content=body,   # ✅ clean table content only
+                        metadata=meta
                     )
-                    sub_meta["part"] = f"{idx + 1}/{len(sub_texts)}"
-                    docs.append(Document(page_content=content, metadata=sub_meta))
+                )
+                continue
+
+            # -------------------------
+            # ✅ TEXT SPLITTING (token-based only)
+            # -------------------------
+            sub_texts = self._semantic_splitter.split(body)
+
+            for idx, sub_text in enumerate(sub_texts):
+                sub_text = sub_text.strip()
+                if not sub_text:
+                    continue
+
+                sub_meta = meta.copy()
+                sub_meta["chunk_id"] = f"{self._generate_chunk_id(sub_text, meta)}_{idx}"
+                sub_meta["part"] = f"{idx + 1}/{len(sub_texts)}"
+
+                docs.append(
+                    Document(
+                        page_content=sub_text,   # ✅ NO HEADER, NO LABEL
+                        metadata=sub_meta
+                    )
+                )
 
         return docs
     
@@ -333,20 +363,16 @@ class HeaderAwareTextSplitter:
             tasks = [bounded_generate(d) for d in docs]
             return await asyncio.gather(*tasks)
 
-        try:
-            loop = asyncio.get_event_loop()
-            contexts = loop.run_until_complete(enrich_all())
-        except RuntimeError:
-            contexts = asyncio.run(enrich_all())
+        nest_asyncio.apply()          # patch BEFORE any event loop interaction
+        contexts = asyncio.run(enrich_all())
 
         for doc, ctx in zip(docs, contexts):
             doc.metadata["context_prefix"] = ctx
-            doc.metadata["embed_content"] = (
-                f"[{doc_title} Context: {ctx}]\n\n{doc.page_content}"
-                if ctx else doc.page_content
-            )
+            doc.metadata["embed_content"] = doc.page_content
 
         return docs
+
+        
     
     def split_plain_text(self, text: str, base_metadata: dict) -> list[Document]:
         sections = _detect_text_headers(text)
@@ -410,9 +436,9 @@ def _paragraph_sections(text: str, splitter: "SemanticAwareTextSplitter | None" 
         return [("", block) for block in merged]
 
     sections: list[tuple[str, str]] = []
-    max_size = splitter.MAX_CHUNK_CHARS
+    max_size = splitter.MAX_TOKENS
     for block in merged:
-        if len(block) > max_size:
+        if count_tokens(block) > max_size:
             for sub in splitter.split(block):
                 if sub.strip():
                     sections.append(("", sub.strip()))
@@ -597,12 +623,8 @@ class MultiFormatDocumentLoader:
         return (sum(len(w) for w in words) / len(words)) < 2.5
 
     def _run_async_ocr(self, file_path: str, origin_info: str) -> str:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self._get_ocr_text_async(file_path, origin_info))
+        nest_asyncio.apply()  # only applied when this specific function runs
+        return asyncio.run(self._get_ocr_text_async(file_path, origin_info))
 
     def load_image(self, file_path: str) -> list[Document]:
         print(f"⏳ Processing image: {os.path.basename(file_path)}")
