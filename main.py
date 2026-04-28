@@ -7,7 +7,7 @@ from typing import TypedDict, List, Any, Dict
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
-from script import condense_chain,router_chain, math_coding_chain, math_answering_chain, format_documents, prompt, model, HISTORY_KEY, extract_python_code, generate_hyde_query, math_validation_chain
+from script import condense_chain, unified_chain, math_coding_chain, math_answering_chain, format_documents, prompt, model, HISTORY_KEY, extract_python_code, generate_hyde_query, math_validation_chain
 from retriever import retriever
 from logger_utils import log_timing, log_debug, timed
 import time 
@@ -35,9 +35,9 @@ class AgentState(TypedDict):
 
 # --- Graph Nodes ---
 class AgentNodes:
-    def __init__(self, condense_chain, router_chain, math_coding_chain, math_answering_chain, retriever, prompt, model):
+    def __init__(self, condense_chain, unified_chain, math_coding_chain, math_answering_chain, retriever, prompt, model):
         self.condense_chain = condense_chain
-        self.router_chain = router_chain 
+        self.unified_chain = unified_chain
         self.math_coding_chain = math_coding_chain
         self.math_answering_chain = math_answering_chain
         self.retriever = retriever
@@ -52,28 +52,30 @@ class AgentNodes:
         uploaded_doc_text = state.get("uploaded_doc_text", "")
         available_files = state.get("available_files", [])
         ui_target_files=state.get("target_files",[])
-        log_debug(f"Starting Parallel Pre-processing for: {user_query}")
+        log_debug(f"Starting unified prompt: {user_query}")
         # 1. Math Intent Classifier (Condense Chain)
         step_start = time.perf_counter()
         
-        condense_task = self.condense_chain.ainvoke({
+        condense_task = await self.condense_chain.ainvoke({
             "question": user_query,     
             HISTORY_KEY: chat_histories,
-            "unique_docs_map": uploaded_doc_text[:3000] if uploaded_doc_text else "No uploaded document."
         })
+        unified_result_raw = {}
+        condensed_result_raw ={}
         if uploaded_doc_text:
-            router_task = self.router_chain.ainvoke({
-            "question": user_query,
-            "uploaded_text": uploaded_doc_text[:1000], # Snippet for speed
-            "available_files": str(available_files)
-            })
-            gather_results = await asyncio.gather(router_task, condense_task, return_exceptions=True)
-            router_result_raw, condensed_result_raw = gather_results
-            log_timing(f"[LATENCY] Condense + Router (parallel): {(time.perf_counter() - step_start) * 1000:.2f} ms")
+            try:
+                unified_result_raw = await self.unified_chain.ainvoke({
+                "question": user_query,
+                HISTORY_KEY: chat_histories,
+                "uploaded_doc_text": uploaded_doc_text[:2000], 
+                "available_files": str(available_files)
+                })
+            except Exception as e:
+                unified_result_raw = e
+            log_timing(f"[LATENCY] unified refine with docs: {(time.perf_counter() - step_start) * 1000:.2f} ms")
         else:
             log_debug("[ROUTER] No document uploaded. Skipping router chain.")
-            # Only run condense and set a default empty list for router
-            router_result_raw = {"target_files": []}
+            # Only run condense and set a default empty list for router            
             try:
                 condensed_result_raw = await condense_task
             except Exception as e:
@@ -81,26 +83,45 @@ class AgentNodes:
 
         log_timing(f"[LATENCY] Pre-processing: {(time.perf_counter() - step_start) * 1000:.2f} ms")
 
-        if isinstance(router_result_raw, Exception):
-            log_debug(f"[WARN] Router chain failed: {router_result_raw}. Defaulting to no file filter.")
+        if isinstance(unified_result_raw, Exception):
+            log_debug(f"[WARN] Router chain failed: {unified_result_raw}. Defaulting to no file filter.")
             llm_target_files = []
         else:
-            llm_target_files = router_result_raw.get("target_files", [])
+            llm_target_files = unified_result_raw.get("target_files", [])
         #combining the router llm and ui initiated document target
-        combined_target_files=list(set(llm_target_files+ui_target_files))
         # ── Safely unpack condense result ────────────────────────────────────
         if isinstance(condensed_result_raw, Exception):
             log_debug(f"[WARN] Condense chain failed: {condensed_result_raw}. Using original query as fallback.")
             retrieval_queries = [user_query]
             generation_question = user_query
             math_intent = False
+            log_debug(f"Condensed Result: {condensed_result_raw}")
         else:
             retrieval_queries = condensed_result_raw.get("retrieval_queries", [user_query])
             generation_question = condensed_result_raw.get("generation_question", user_query)
             math_intent = condensed_result_raw.get("math_intent", False)
-
+            log_debug(f"Condensed Result: {condensed_result_raw}")
+        
+        if isinstance(unified_result_raw, Exception):
+            log_debug(f"[WARN] unified process failed:{unified_result_raw}. using original details as fallback")
+            query_list=uploaded_doc_text[:500].split("\n")
+            doc_snippet = "\n".join(line for line in query_list[:5] if line.strip())
+            retrieval_queries = [user_query, doc_snippet] if doc_snippet else [user_query]
+            generation_question = user_query
+            math_intent = True
+            llm_target_files = []
+            log_debug(f"Condensed Result: {unified_result_raw}")
+        else:
+            query_list=uploaded_doc_text[:500].split("\n")
+            doc_snippet = "\n".join(line for line in query_list[:5] if line.strip())
+            fallback_queries = [user_query, doc_snippet] if doc_snippet else [user_query]
+            retrieval_queries = unified_result_raw.get('retrieval_queries',fallback_queries)
+            generation_question = unified_result_raw.get('generation_question',user_query)
+            math_intent = unified_result_raw.get("math_intent", False)
+            llm_target_files=unified_result_raw.get('target_files',[])
+        combined_target_files=list(set(llm_target_files+ui_target_files))
         log_debug(f"Router matched: {combined_target_files} | Math Intent: {math_intent}")
-        log_debug(f"Condensed Result: {condensed_result_raw}")
+        log_debug(f"Condensed Result: {unified_result_raw}")
 
         # ── Step 2: Retrieve ONCE ────────────────────────────────────────────
         step_start = time.perf_counter()
@@ -332,7 +353,7 @@ class AgentNodes:
 
 # --- Graph Construction ---
 def build_graph() -> StateGraph:
-    nodes = AgentNodes(condense_chain, router_chain, math_coding_chain, math_answering_chain, retriever, prompt, model)
+    nodes = AgentNodes(condense_chain, unified_chain, math_coding_chain, math_answering_chain, retriever, prompt, model)
     
     workflow = StateGraph(AgentState)
     
