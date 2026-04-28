@@ -32,13 +32,6 @@ _math_coding_model = OllamaLLM(
     streaming=False,    # Prevents Ollama tool-call parse errors on arithmetic output
     temperature=0.1,
 )
-
-_router_model = OllamaLLM(
-    model=MODEL_NAME,
-    base_url=OLLAMA_BASE_URL,
-    streaming=False,
-    temperature=0,
-)
 _hyde_model = OllamaLLM(
     model=MODEL_NAME,
     base_url=OLLAMA_BASE_URL,
@@ -65,22 +58,17 @@ Rules:
 5. math_intent=true only when a calculation, formula, or numerical derivation is explicitly required.
 6. If the question is a greeting or trivially simple, return the original question as-is with math_intent=false.
 7. Do NOT hallucinate specificity. If vague, keep it vague.
-
-Document context (use only to improve query specificity):
-{unique_docs_map}
-8 **Remember**: While writing multi-query for retrieval for document based matching always include the listed classes in it 
   --For example
-  User Question: "Verify the bill?
-  Document context : [uploaded document text]
+  User Question: "What are the billing components, charges, and taxes for a 20 kW Company A commercial electricity connection, and how are they calculated?"
   Output:
 {{
   "retrieval_queries": [
-    "verify calculation of energy bill for company_name", 
-    "fixed price of the bill and it info from document",
-    "energy charges and it info from document",
-    "taxes and its info from document" #all the relavent things from the document
+    "Billing components for 20 kW Company A commercial connection", 
+    "How demand charges are calculated in Company A commercial tariff",
+    "Taxes and surcharges in Company A electricity bills",
+    "Example calculation of a 20 kW commercial electricity bill under Company A"
   ],
-  "generation_question": "Can you verify the fixed charge calculation for this bill `billing info`?",
+  "generation_question": "What components, charges, and taxes make up a 20 kW Company A commercial electricity bill, and how is each calculated?`?",
   "math_intent": true
 }}"""
     ),
@@ -133,26 +121,6 @@ prompt = ChatPromptTemplate.from_messages([
     MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
     ("human", "{question}"),
 ])
-
-# --- Router Logic (For targeting uploaded files) ---
-router_prompt = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a document classification API.\n"
-     "Match the uploaded document snippet to the correct file(s) from AVAILABLE FILES.\n\n"
-     "RULES:\n"
-     "1. Exact regional match preferred (e.g., 'Poorv'=East, 'Madhya'=Central, 'Dakshin'=South, 'Paschim'=West).\n"
-     "2. If State is clear but region is ambiguous, return ALL files from that state.\n"
-     "3. Respond ONLY with raw JSON. No markdown.\n\n"
-     "AVAILABLE FILES: {available_files}\n\n"
-     "Format:\n"
-     "{{\n  \"target_files\": [\"filename1.pdf\", \"filename2.pdf\"]\n}}\n\n"
-     "If no match: {{\"target_files\": []}}."),
-    ("human", "User Query: {question}\n\nUploaded Document Snippet:\n{uploaded_text}")
-])
-
-
-# Build the complete chain
-router_chain = router_prompt | _router_model | JsonOutputParser()
 
 math_coding_prompt = ChatPromptTemplate.from_messages([
     (
@@ -313,6 +281,91 @@ CONTEXT (tariff documents):
 ])
 
 math_validation_chain = math_validation_prompt | _math_coding_model | JsonOutputParser()
+
+# --- Unified Pre-processing Prompt (Condense + Router) ---
+_unified_model = OllamaLLM(
+    model=MODEL_NAME,
+    base_url=OLLAMA_BASE_URL,
+    streaming=False,
+    temperature=0.2,      
+)
+
+unified_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """You are a specialized query rewriter and document routing assistant for a RAG system. 
+Output ONLY raw, valid JSON. Do not include markdown blocks or preamble.
+
+### Example:
+   Question: please verify this bill
+   
+   Available_files=[`document1`, `document2`,.....]
+   --------------------------
+   Document context:
+   Tariff Class: LV2 [LV2.2]
+    Region: Madhya Pradesh Poorv Kshetra Vidyut Vitran Company Ltd.
+
+    Units Consumed: 785
+
+    Meter Readings:
+    - Previous Reading: 38976
+    - Current Reading: 39761
+
+    Bill Details:
+    - Energy Charges: 6304.26
+    - Fixed Charges: 992.24
+    - Electricity Duty: 910.00
+    - FPPAS Charges: -77.28
+    - Other Charges: -217.95
+
+    Total Bill Amount: 7911.26
+
+    Load Sanctioned: 8.0 kW
+    Consumer Type: Telecom Tower
+    Billing Month: MAR-2026
+    ---------------------------------
+    Expected Output:
+{{
+  "retrieval_queries": ["how to calculate electricity units from meter readings current 39761 previous 38976",
+  "components of electricity bill LV2.2 tariff for Load Sanctioned of 8.0 kw",
+  "fixed charges electricity duty and FPPAS calculation in MP electricity bill",
+  "Electric Bill of Madhya Pradesh Poorv Kshetra Vidyut Vitran Company Ltd"
+  ],
+  "generation_question": "Is this electricity bill correct based on the meter readings, units consumed, and total amount, and how are the charges calculated under the LV2.2 tariff in Madhya Pradesh for a telecom tower connection?",
+  "math_intent": True,
+  "target_files": ["MP_EAST.pdf"]
+}}
+
+### RULES FOR QUERY REWRITING:
+1. **Self-Containment**: Replace pronouns (it, this, they) with the specific entities mentioned in context.
+2. **Decomposition**: Split into multiple `retrieval_queries` if the user asks about distinct entities, years, or concepts.
+3. **Domain Specifics**: Preserve specific tariff classes, voltage levels (kV), and consumer categories.
+4. **Math Detection**: Set `math_intent: true` ONLY if the user requires a calculation, formula, or numerical derivation.
+5. **Simplicity**: For greetings or non-technical chatter, return the original text with `math_intent: false`.
+
+### RULES FOR DOCUMENT ROUTING:
+1. **Regional Mapping**: Use these regional keywords to identify files:
+   - 'Poorv' / 'Purv' -> East
+   - 'Madhya' -> Central
+   - 'Dakshin' -> South
+   - 'Paschim' -> West
+2. **State Logic**: If the State is identified but the region is ambiguous, return ALL filenames associated with that State.
+3. **Precision**: Match the 'Uploaded Document Snippet' against the 'AVAILABLE FILES' list.
+4. **Fallback**: If no match is found or no snippet is provided, `target_files` MUST be [].
+
+AVAILABLE FILES:
+{available_files}
+"""
+    ),
+    MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
+    (
+        "human", 
+        "User Question: {question}\n\nUploaded Document Snippet:\n{uploaded_doc_text}"
+    ),
+])
+
+unified_chain = unified_prompt | _unified_model | JsonOutputParser()
+
 def generate_hyde_query(question: str) -> str:
     """
     Generates a hypothetical document passage for a given question.

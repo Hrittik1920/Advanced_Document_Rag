@@ -33,7 +33,7 @@ QDRANT_URL = settings.QDRANT_URL
 DB_LOCATION         = "./hybrid_db"
 FILE_HASH_DB        = os.path.join(DB_LOCATION, "file_hashes.json")
 BM25_INDEX_FILE     = os.path.join(DB_LOCATION, "bm25_index.pkl")
-COLLECTION_NAME     = "multi_format_documents"
+COLLECTION_NAME     = settings.COLLECTION_NAME
 
 EMBEDDING_BASE_URL = settings.LLM_ENDPOINT
 DEFAULT_OLLAMA_ENDPOINT = "http://localhost:11434"
