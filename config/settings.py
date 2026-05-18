@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     QDRANT_URL: str
     CONTEXT_MODEL: str # New setting for the context model
     COLLECTION_NAME: str
+    PG_HOST: str
+    PG_PORT: int
+    PG_DB: str
+    PG_USER: str
+    PG_PASSWORD: str
+    MEMO_COLLECTION: str
+    MAX_HISTORY_MESSAGES: int = 6
+    MAX_MSG_CHARS: int = 400
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8"

@@ -29,7 +29,7 @@ class AgentState(TypedDict):
     execution_result: str
     validation_result: Dict
     validation_passed: bool
-    
+    combined_target_files: List[str] = []
     # Final Output
     final_response: str
 
@@ -55,11 +55,6 @@ class AgentNodes:
         log_debug(f"Starting unified prompt: {user_query}")
         # 1. Math Intent Classifier (Condense Chain)
         step_start = time.perf_counter()
-        
-        condense_task = await self.condense_chain.ainvoke({
-            "question": user_query,     
-            HISTORY_KEY: chat_histories,
-        })
         unified_result_raw = {}
         condensed_result_raw ={}
         if uploaded_doc_text:
@@ -68,26 +63,25 @@ class AgentNodes:
                 "question": user_query,
                 HISTORY_KEY: chat_histories,
                 "uploaded_doc_text": uploaded_doc_text[:2000], 
-                "available_files": str(available_files)
+                "available_files": str(available_files),
                 })
             except Exception as e:
                 unified_result_raw = e
             log_timing(f"[LATENCY] unified refine with docs: {(time.perf_counter() - step_start) * 1000:.2f} ms")
         else:
-            log_debug("[ROUTER] No document uploaded. Skipping router chain.")
-            # Only run condense and set a default empty list for router            
+            # ── No-doc path: condense chain handles query rewriting ──────────
+            log_debug("[ROUTER] No document uploaded. Skipping unified chain.")
             try:
-                condensed_result_raw = await condense_task
+                condensed_result_raw = await self.condense_chain.ainvoke({
+                    "question": user_query,
+                    HISTORY_KEY: chat_histories,
+                    "available_files": str(available_files),
+                })
             except Exception as e:
                 condensed_result_raw = e
 
         log_timing(f"[LATENCY] Pre-processing: {(time.perf_counter() - step_start) * 1000:.2f} ms")
-
-        if isinstance(unified_result_raw, Exception):
-            log_debug(f"[WARN] Router chain failed: {unified_result_raw}. Defaulting to no file filter.")
-            llm_target_files = []
-        else:
-            llm_target_files = unified_result_raw.get("target_files", [])
+        
         #combining the router llm and ui initiated document target
         # ── Safely unpack condense result ────────────────────────────────────
         if isinstance(condensed_result_raw, Exception):
@@ -95,11 +89,13 @@ class AgentNodes:
             retrieval_queries = [user_query]
             generation_question = user_query
             math_intent = False
+            condense_target_files = []
             log_debug(f"Condensed Result: {condensed_result_raw}")
         else:
             retrieval_queries = condensed_result_raw.get("retrieval_queries", [user_query])
             generation_question = condensed_result_raw.get("generation_question", user_query)
             math_intent = condensed_result_raw.get("math_intent", False)
+            condense_target_files = condensed_result_raw.get("target_files", [])
             log_debug(f"Condensed Result: {condensed_result_raw}")
         
         if isinstance(unified_result_raw, Exception):
@@ -109,17 +105,22 @@ class AgentNodes:
             retrieval_queries = [user_query, doc_snippet] if doc_snippet else [user_query]
             generation_question = user_query
             math_intent = True
-            llm_target_files = []
-            log_debug(f"Condensed Result: {unified_result_raw}")
+            unified_target_files = []
+            log_debug(f"Unified Result (error): {unified_result_raw}")
         else:
             query_list=uploaded_doc_text[:500].split("\n")
             doc_snippet = "\n".join(line for line in query_list[:5] if line.strip())
             fallback_queries = [user_query, doc_snippet] if doc_snippet else [user_query]
-            retrieval_queries = unified_result_raw.get('retrieval_queries',fallback_queries)
-            generation_question = unified_result_raw.get('generation_question',user_query)
+            retrieval_queries = unified_result_raw.get("retrieval_queries", fallback_queries)
+            generation_question = unified_result_raw.get("generation_question", user_query)
             math_intent = unified_result_raw.get("math_intent", False)
-            llm_target_files=unified_result_raw.get('target_files',[])
-        combined_target_files=list(set(llm_target_files+ui_target_files))
+            unified_target_files = unified_result_raw.get("target_files", [])
+            log_debug(f"Unified Result: {unified_result_raw}")
+
+        # FIX #3: Merge ALL three sources of target files instead of overwriting
+        combined_target_files = list(
+            set(unified_target_files + condense_target_files + ui_target_files)
+        )
         log_debug(f"Router matched: {combined_target_files} | Math Intent: {math_intent}")
         log_debug(f"Condensed Result: {unified_result_raw}")
 
@@ -193,6 +194,7 @@ class AgentNodes:
             "math_intent": math_intent,
             "context": context,
             "citations": citations,
+            "combined target_files": combined_target_files,
         }
 
     async def text_path(self, state: AgentState) -> dict:
@@ -220,10 +222,15 @@ class AgentNodes:
             log_debug(f"[MATH] Generated code:\n{code}")
         except Exception as e:
             if "error parsing tool call" in str(e):
-                # Extract the 'raw' part from the error message using regex
-                raw_math = re.search(r"raw='(.*?)'", str(e)).group(1)
-                # Manually construct a valid tool call or fallback response
-                print(f"Rescued raw math: {raw_math}")
+                match = re.search(r"raw='(.*?)'", str(e))   # FIX #2: check before .group()
+                if match:
+                    raw_math = match.group(1)
+                    log_debug(f"[MATH] Rescued raw output: {raw_math}")
+                    code = extract_python_code(raw_math)
+                else:
+                    log_debug(f"[MATH] Could not rescue raw output from error: {e}")
+            else:
+                raise 
         return {"generated_code": code}
 
     async def math_execute(self, state: AgentState) -> dict:
@@ -253,9 +260,9 @@ class AgentNodes:
                     "line_item_checks": [],
                     "missing_components": [],
                     "extra_components": [],
-                    "arithmetic_check": {}
+                    "arithmetic_check": {},
                 },
-                "validation_passed": False
+                "validation_passed": False,
             }
 
         try:
@@ -280,13 +287,13 @@ class AgentNodes:
                 "line_item_checks": [],
                 "missing_components": [],
                 "extra_components": [],
-                "arithmetic_check": {}
+                "arithmetic_check": {},
             }
             validation_passed = True
 
         return {
             "validation_result": validation_result,
-            "validation_passed": validation_passed
+            "validation_passed": validation_passed,
         }
 
     async def synthesize_response(self, state: AgentState) -> dict:
@@ -345,7 +352,7 @@ class AgentNodes:
                 f"Recommendation: {recommendation} (confidence: {confidence:.0%})\n\n"
                 f"{formatted_validation}\n\n"
                 f"Summary: {v.get('summary', '')}"
-            )
+            ),
         })
 
         log_debug(f"MATH Synthesized Response: {response}")
@@ -374,7 +381,7 @@ def build_graph() -> StateGraph:
         lambda state: "math_path" if state.get("math_intent") else "text_path",
         {
             "math_path": "math_generate",
-            "text_path": "text_path"
+            "text_path": "text_path",
         }
     )
     
@@ -390,7 +397,7 @@ def build_graph() -> StateGraph:
             "synthesize_response": "synthesize_response",
             # On hard REJECT, fall back to the text path which will explain
             # what went wrong using the context without fake numbers
-            "text_path": "text_path"
+            "text_path": "text_path",
         }
     )
     

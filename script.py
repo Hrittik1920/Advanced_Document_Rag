@@ -15,7 +15,7 @@ from typing import Tuple
 MODEL_NAME = settings.LLM_MODEL_NAME
 OLLAMA_BASE_URL = settings.LLM_ENDPOINT
 MAX_CONTEXT_CHARS = 30_000
-HISTORY_KEY = settings.HISTORY_DIR
+HISTORY_KEY = "chat_histories"
 # --- Model ---
 model = OllamaLLM(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, streaming=True)
 # --- Condense Prompt (rewrites follow-up questions to be ) ---
@@ -23,7 +23,7 @@ _condense_model = OllamaLLM(
     model=MODEL_NAME,
     base_url=OLLAMA_BASE_URL,
     streaming=False,
-    temperature=0.2,      
+    temperature=0.3,      
 )
 
 _math_coding_model = OllamaLLM(
@@ -57,22 +57,27 @@ Rules:
 4. generation_question must be natural and human-readable.
 5. math_intent=true only when a calculation, formula, or numerical derivation is explicitly required.
 6. If the question is a greeting or trivially simple, return the original question as-is with math_intent=false.
-7. Do NOT hallucinate specificity. If vague, keep it vague.
+7. These are some of the AVAILABLE FILES on which your work is to check which files are associated with the question and the uploaded document snippet. Use this information to guide your rewriting and routing decisions. Return the list of relevant files in the "target_files" field. If no relevant files are found, return an empty list.
+==================
+{available_files}
+==================
+8. Do NOT hallucinate specificity. If vague, keep it vague.
   --For example
   User Question: "What are the billing components, charges, and taxes for a 20 kW Company A commercial electricity connection, and how are they calculated?"
   Output:
 {{
   "retrieval_queries": [
-    "Billing components for 20 kW Company A commercial connection", 
+    "Billing components for 20 kW Company A commercial connection",
     "How demand charges are calculated in Company A commercial tariff",
     "Taxes and surcharges in Company A electricity bills",
     "Example calculation of a 20 kW commercial electricity bill under Company A"
   ],
-  "generation_question": "What components, charges, and taxes make up a 20 kW Company A commercial electricity bill, and how is each calculated?`?",
-  "math_intent": true
+  "generation_question": "What components, charges, and taxes make up a 20 kW Company A commercial electricity bill, and how is each calculated?",
+  "math_intent": true,
+  "target_files": []
 }}"""
     ),
-    MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
+    MessagesPlaceholder(variable_name=HISTORY_KEY),
     ("human", "{question}"),
 ])
 condense_chain = condense_prompt | _condense_model | JsonOutputParser()
@@ -118,7 +123,7 @@ prompt = ChatPromptTemplate.from_messages([
 
         "CONTEXT:\n---\n{context}\n---"
     ),
-    MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
+    MessagesPlaceholder(variable_name=HISTORY_KEY),   # FIX 2b
     ("human", "{question}"),
 ])
 
@@ -131,6 +136,8 @@ math_coding_prompt = ChatPromptTemplate.from_messages([
         "2. Do NOT write any text, explanation, or arithmetic OUTSIDE the code block.\n"
         "3. The script MUST call print() with the final answer as its last action.\n"
         "4. Available libraries: math, numpy (import as np), pandas (import as pd).\n\n"
+        "5. Use the provided CONTEXT and data to derive your calculations. Do NOT use any outside knowledge or assumptions.\n\n"
+        "6. Use provided context to identify the correct rates, units, and formulas. If the context is insufficient to solve the problem, write a script that prints 'INSUFFICIENT_CONTEXT'.\n\n"
         "CORRECT example:\n"
         "```python\n"
         "fixed_charge = 500.0\n"
@@ -142,10 +149,10 @@ math_coding_prompt = ChatPromptTemplate.from_messages([
         "500.0 + 3200.0 = 3700.0\n\n"
         "### Source data (extracted from uploaded bill):\n"
         "{data}\n\n"
-        "### Additional context from knowledge base:\n"
+        "### RELEVENT context from the knowledge base:\n"
         "---\n{context}\n---"
     ),
-    ("human", "{question}")
+    ("human", "{question}"),
 ])
 
 math_answering_prompt = ChatPromptTemplate.from_messages([
@@ -293,7 +300,7 @@ _unified_model = OllamaLLM(
 unified_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are a specialized query rewriter and document routing assistant for a RAG system. 
+        """You are a specialized query rewriter and document routing assistant for a RAG system.
 Output ONLY raw, valid JSON. Do not include markdown blocks or preamble.
 
 ### Example:
@@ -332,7 +339,7 @@ Output ONLY raw, valid JSON. Do not include markdown blocks or preamble.
   "Electric Bill of Madhya Pradesh Poorv Kshetra Vidyut Vitran Company Ltd"
   ],
   "generation_question": "Is this electricity bill correct based on the meter readings, units consumed, and total amount, and how are the charges calculated under the LV2.2 tariff in Madhya Pradesh for a telecom tower connection?",
-  "math_intent": True,
+  "math_intent": true,
   "target_files": ["MP_EAST.pdf"]
 }}
 
@@ -342,6 +349,15 @@ Output ONLY raw, valid JSON. Do not include markdown blocks or preamble.
 3. **Domain Specifics**: Preserve specific tariff classes, voltage levels (kV), and consumer categories.
 4. **Math Detection**: Set `math_intent: true` ONLY if the user requires a calculation, formula, or numerical derivation.
 5. **Simplicity**: For greetings or non-technical chatter, return the original text with `math_intent: false`.
+6. **Context-Aware Rewriting**: Use the 'Uploaded Document Snippet' to identify key entities (e.g., DISCOM name, tariff class, units consumed) and ensure they are explicitly mentioned in the rewritten queries and generation question.
+7.**REMEMBER**: Prtiotise the tariff rule only then the retrival models can find the relevant documents from the chunk.if the question is about bill verification, the most important entities to include are:
+- Meter readings (current and previous)
+- Units consumed
+- Total bill amount
+- Tariff class (e.g., LV2.2)
+- Consumer type (e.g., Telecom Tower)
+- DISCOM name (e.g., Madhya Pradesh Poorv Kshetra Vidyut Vitran Company Ltd)
+- All data related to the bill components (e.g., energy charges, fixed charges, electricity duty, FPPAS charges)
 
 ### RULES FOR DOCUMENT ROUTING:
 1. **Regional Mapping**: Use these regional keywords to identify files:
@@ -357,7 +373,7 @@ AVAILABLE FILES:
 {available_files}
 """
     ),
-    MessagesPlaceholder(variable_name=settings.HISTORY_DIR),
+    MessagesPlaceholder(variable_name=HISTORY_KEY),   
     (
         "human", 
         "User Question: {question}\n\nUploaded Document Snippet:\n{uploaded_doc_text}"
@@ -373,15 +389,14 @@ def generate_hyde_query(question: str) -> str:
     The passage is intentionally written to sound like the *answer*
     would appear in an actual tariff document. Embedding this passage
     instead of the raw question dramatically improves retrieval recall
-    for sparse, jargon-heavy queries (e.g. "what is the TOD rebate
-    for HT Industrial consumers in MSEDCL?").
+    for sparse, jargon-heavy queries.
 
     Args:
         question: The user's standalone question (post-condense).
 
     Returns:
         A short hypothetical passage string ready to be passed to
-        retriever.ainvoke().  Falls back to the original question
+        retriever.ainvoke(). Falls back to the original question
         if generation fails so the caller never gets None.
     """
     try:
@@ -475,16 +490,3 @@ def format_documents(docs: list) -> Tuple[str, list]:
         })
 
     return "\n\n".join(formatted), citation
-
-
-original_chain = (
-    {
-        "context": lambda x: x["context"],
-        "question": lambda x: x["question"],
-        "uploaded_doc_text": lambda x: x.get("uploaded_doc_text", ""), # <-- Map the new variable
-        HISTORY_KEY: lambda x: x[HISTORY_KEY],
-    }
-    | prompt
-    | model
-    | StrOutputParser()
-)
