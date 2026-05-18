@@ -21,7 +21,7 @@ import io
 import tempfile
 from extraction import MultiFormatDocumentLoader, SuryaLayoutExtractor
 warnings.filterwarnings("ignore", category=FutureWarning)
-from script import format_documents, original_chain, condense_chain, unified_chain
+from script import format_documents,  condense_chain, unified_chain
 import os 
 from datetime import datetime
 from main import app as langgraph_app
@@ -35,63 +35,28 @@ active_tasks: Dict[str, asyncio.Task] = {}
 from retriever import retriever
 import fitz
 
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, messages_from_dict, messages_to_dict
+from context_memory import (
+    get_session_history,       
+    store_uploaded_document,   
+    evict_session,             
+    shutdown_memo,
+)
+from contextlib import asynccontextmanager
+from langchain_core.messages import HumanMessage, AIMessage
 from config import settings
 
 # --- CONFIGURATION ---
 HISTORY_DIR = settings.HISTORY_DIR
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
-# --- Custom Chat History Class for File Persistence ---
-# This class is already perfect and needs no changes.
-class FileChatMessageHistory(BaseChatMessageHistory):
-    session_id: str
-    file_path: str
-
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.file_path = os.path.join(HISTORY_DIR, f"{self.session_id}.json")
-
-    @property
-    def messages(self) -> List[BaseMessage]:
-        if not os.path.exists(self.file_path):
-            return []
-        with open(self.file_path, "r", encoding="utf-8") as f:
-            try:
-                dicts = json.load(f)
-                all_messages = messages_from_dict(dicts)
-                all_messages = all_messages[-6:]
-                for msg in all_messages:
-                    if hasattr(msg, "content") and isinstance(msg.content, str):
-                        msg.content = msg.content.strip()[:300]
-                return all_messages
-            except json.JSONDecodeError:
-                return []
-
-    def add_messages(self, messages: List[BaseMessage]) -> None:
-        # current_messages = self.messages
-        if not os.path.exists(self.file_path):
-            current_messages = []
-        else:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                try:
-                    dicts = json.load(f)
-                    current_messages = messages_from_dict(dicts)
-                except json.JSONDecodeError:
-                    current_messages = []
-        current_messages.extend(messages)
-        with open(self.file_path, "w", encoding="utf-8") as f:
-            dicts = messages_to_dict(current_messages)
-            json.dump(dicts, f, indent=2)
-
-    def clear(self) -> None:
-        if os.path.exists(self.file_path):
-            os.remove(self.file_path)
 
 # --- FastAPI & Socket.IO App Initialization ---
+@asynccontextmanager
+async def lifespan(app):
+    yield                  # startup — nothing extra needed
+    shutdown_memo()  
 app = FastAPI(
+    lifespan=lifespan,
     title="RAG API Server with Per-User History",
     description="An API for a multi-user document assistant that persists conversation history.",
     version="2.2.0"
@@ -107,12 +72,7 @@ sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 socket_app = socketio.ASGIApp(sio, app)
 
 # In-memory cache for history objects to improve performance.
-store: Dict[str, BaseChatMessageHistory] = {}
 
-def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    if session_id not in store:
-        store[session_id] = FileChatMessageHistory(session_id=session_id)
-    return store[session_id]
 
 def _extract_stream_text(event: Dict[str, Any]) -> str:
     """Extract token text from either chat-model or llm stream events."""
@@ -145,14 +105,6 @@ def _extract_stream_text(event: Dict[str, Any]) -> str:
 
     return ""
 
-# Wrap the LangChain chain with the history management logic.
-chain_with_history = RunnableWithMessageHistory(
-    original_chain,
-    get_session_history,
-    input_messages_key="question",
-    history_messages_key=HISTORY_DIR,
-)
-
 # --- Socket.IO Event Handlers ---
 @sio.event
 async def connect(sid, environ):
@@ -161,9 +113,7 @@ async def connect(sid, environ):
 @sio.event
 async def disconnect(sid):
     print(f"Client disconnected: {sid}")
-    # Clean up from the in-memory cache on disconnect.
-    if sid in store:
-        del store[sid]
+    evict_session(sid)  
 
 @sio.on("chat_request")
 @timed
@@ -224,11 +174,16 @@ async def run_llm_logic(sid, data: dict):
                 
             docs = await asyncio.to_thread(process_uploaded_file)
             if isinstance(docs, str):
-                uploaded_doc_text=docs
+                uploaded_doc_text = docs
             elif isinstance(docs, list):
                 uploaded_doc_text = "\n\n".join([d.page_content for d in docs])
             else:
-                uploaded_doc_text=str(docs)
+                uploaded_doc_text = str(docs)
+
+            # Save unconditionally, regardless of which branch ran
+            if uploaded_doc_text:
+                history_obj = get_session_history(sid)
+                history_obj.save_document(uploaded_doc_text, filename=file_name)
             log_debug(f"Extracted {len(uploaded_doc_text)} chars from uploaded document.")
             
         except Exception as e:
@@ -246,6 +201,21 @@ async def run_llm_logic(sid, data: dict):
     files_response = await get_available_files()
     available_files = files_response.get("files", [])
     history_obj = get_session_history(sid)
+    # --- ADD THIS BLOCK TO PRINT HISTORY TO TERMINAL ---
+    print(f"\n=== LOADED HISTORY FOR SESSION: {sid} ===")
+    for i, msg in enumerate(history_obj.messages):
+        # msg.type will be 'human', 'ai', or 'system'
+        snippet = msg.content[:60].replace("\n", " ") + ("..." if len(msg.content) > 60 else "")
+        metadata = msg.additional_kwargs
+        print(f"[{i}] {msg.type.upper()}: {snippet} | metadata: {metadata}")
+    print("================================================\n")
+    # ---------------------------------------------------
+    if not ui_target_files and history_obj.messages:
+        # Look backwards through the messages for the last AI message with target_files
+        for msg in reversed(history_obj.messages):
+            if isinstance(msg, AIMessage) and "target_files" in msg.additional_kwargs:
+                ui_target_files = msg.additional_kwargs["target_files"]
+                break
 
     # 1. Initialize Graph State
     initial_state = {
@@ -262,6 +232,8 @@ async def run_llm_logic(sid, data: dict):
     final_citations = []
     final_response_text = ""
     fallback_final_response = ""
+    
+    final_target_files = ui_target_files
 
     start = time.perf_counter()
 
@@ -276,6 +248,10 @@ async def run_llm_logic(sid, data: dict):
                 state_update = event["data"].get("output", {})
                 
                 if isinstance(state_update, dict):
+                    new_files = state_update.get("target_files") or state_update.get("combined_target_files")
+                    if new_files:
+                        final_target_files = new_files
+                        log_debug(f"Successfully captured target_files for history: {final_target_files}")
                     if "citations" in state_update and not final_citations:
                         final_citations = state_update["citations"]
                     if node_name in final_response_nodes:
@@ -288,9 +264,6 @@ async def run_llm_logic(sid, data: dict):
                             await sio.emit("chat_stream_chunk", {"chunk": "\n🔢 **Math intent detected. Activating Math Agent...**\n"}, to=sid)
                         else:
                             await sio.emit("chat_stream_chunk", {"chunk": "🔍 *Searching knowledge base...*\n"}, to=sid)
-                    
-                    # elif node_name == "math_extract":
-                    #     await sio.emit("chat_stream_chunk", {"chunk": "📊 *Parsing numerical data...*\n"}, to=sid)
                     elif node_name == "math_generate":
                         await sio.emit("chat_stream_chunk", {"chunk": "⚙️ *Generating calculation logic...*\n"}, to=sid)
                     elif node_name == "math_execute":
@@ -320,7 +293,10 @@ async def run_llm_logic(sid, data: dict):
         # 3. Save to history and close stream
         history_obj.add_messages([
             HumanMessage(content=user_query),
-            AIMessage(content=final_response_text)
+            AIMessage(
+                content=final_response_text,
+                additional_kwargs={"target_files": final_target_files}
+                )
         ])
         
         await sio.emit("chat_stream_end", {"message": "Stream complete", "citation": final_citations}, to=sid)
@@ -351,14 +327,9 @@ async def read_root():
 
 @app.get("/v1/history/{session_id}")
 def get_history(session_id: str):
-    """A utility endpoint to inspect the history file of a given session.
-    
-    Note: This endpoint should be protected with authentication in production.
-    Currently gated behind DEBUG_HISTORY_ENDPOINT env flag.
-    """
     if not os.getenv("DEBUG_HISTORY_ENDPOINT", "false").lower() == "true":
         raise HTTPException(status_code=403, detail="History endpoint disabled.")
-    history = FileChatMessageHistory(session_id=session_id)
+    history = get_session_history(session_id)  # ← was FileChatMessageHistory(...)
     return history.messages
 
 @app.get("/v1/document-page")

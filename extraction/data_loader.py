@@ -7,7 +7,6 @@ from config import settings
 import nest_asyncio
 import cv2
 import pytesseract
-import numpy as np
 import pandas as pd
 from langchain_core.documents import Document
 from pathlib import Path

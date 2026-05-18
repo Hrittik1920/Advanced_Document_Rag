@@ -1,2 +1,2 @@
-from .data_loader import MultiFormatDocumentLoader, dump_chunks_to_file
+from .data_loader import MultiFormatDocumentLoader, dump_chunks_to_file, ENCODER
 from .upload_extraction import SuryaLayoutExtractor

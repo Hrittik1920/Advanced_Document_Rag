@@ -20,7 +20,7 @@ import uuid
 import concurrent.futures
 from copy import copy
 
-from extraction import MultiFormatDocumentLoader, dump_chunks_to_file, ENCODER 
+from extraction import MultiFormatDocumentLoader, dump_chunks_to_file, SuryaLayoutExtractor, ENCODER
 from config import settings
 from .knowledge_graph import build_graph_retriever, GraphRetriever   # ← new
 
