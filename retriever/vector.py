@@ -23,6 +23,7 @@ from copy import copy
 from extraction import MultiFormatDocumentLoader, dump_chunks_to_file, SuryaLayoutExtractor, ENCODER
 from config import settings
 from .knowledge_graph import build_graph_retriever, GraphRetriever   # ← new
+from copy import deepcopy
 
 
 # ─────────────────────────────────────────────
@@ -63,7 +64,7 @@ def _safe_truncate_docs(docs: list, max_tokens: int = EMBED_HARD_LIMIT) -> list:
                 f"({len(tokens)} → {max_tokens} tokens)"
             )
             text = ENCODER.decode(tokens[:max_tokens])  # slices at token boundary, not character boundary
-            doc = copy(doc)
+            doc = deepcopy(doc)
             doc.page_content = text
             if "embed_content" in doc.metadata:
                 doc.metadata["embed_content"] = text
@@ -482,14 +483,19 @@ def initialize_retriever() -> HybridRetriever:
         print(f"Critical error: Could not initialize QdrantVectorStore: {e}")
         raise e
 
-    if deleted:
+    current_ids = {corpus_doc_id(c) for c in corpus}
+    all_previous_ids = set(bm25_data["ids"]) if bm25_data else set()
+    deleted_ids = list(all_previous_ids - current_ids) # Qdrant requires a list
+
+    if deleted_ids:
         try:
             client.delete(
                 collection_name=COLLECTION_NAME,
-                points_selector=deleted_chunk_ids
+                points_selector=deleted_ids
             )
+            print(f"  Deleted {len(deleted_ids)} stale vectors from Qdrant")
         except Exception as e:
-            print(f"Warning: Could not delete old points from Qdrant: {e}")
+            print(f"  Warning: Could not delete stale vectors: {e}")
 
     # ── Add new documents ─────────────────────────────────────────────────────
     if docs_to_add:
@@ -550,7 +556,10 @@ def initialize_retriever() -> HybridRetriever:
 
     # ── Build knowledge graph ─────────────────────────────────────────────────
     print("Building Knowledge Graph...")
-    graph_ret = build_graph_retriever(corpus)
+    # Safely gather all removed and changed sources to purge from the graph
+    safe_deleted_basenames = {os.path.basename(f) for f in deleted} if deleted else set()
+    stale_sources = list(changed_sources | safe_deleted_basenames)
+    graph_ret = build_graph_retriever(corpus, removed_sources=stale_sources)
 
     # ── Load reranker ─────────────────────────────────────────────────────────
     print(f"Loading reranker: {RERANKER_MODEL}...")

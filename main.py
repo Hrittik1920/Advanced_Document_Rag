@@ -179,12 +179,12 @@ class AgentNodes:
         if not context:
             context = "No relevant documents found in the knowledge base."
 
-        if uploaded_doc_text:
-            with open("upload_content.txt", "w", encoding="utf-8") as f:
-                f.write(uploaded_doc_text)
-
-        with open("chunk.txt", "w", encoding="utf-8") as f:
-            f.write(context)
+        if os.getenv("DEBUG_FILES", "false").lower() == "true":
+            if uploaded_doc_text:
+                with open("upload_content.txt", "w", encoding="utf-8") as f:
+                    f.write(uploaded_doc_text)
+            with open("chunk.txt", "w", encoding="utf-8") as f:
+                f.write(context)
         log_timing(f"[LATENCY] Dedup & Format: {(time.perf_counter() - step_start) * 1000:.2f} ms")
         
         log_timing(f"[TOTAL] classify_and_retrieve node took {(time.perf_counter() - node_start) * 1000:.2f} ms")
@@ -194,7 +194,7 @@ class AgentNodes:
             "math_intent": math_intent,
             "context": context,
             "citations": citations,
-            "combined target_files": combined_target_files,
+            "combined_target_files": combined_target_files,
         }
 
     async def text_path(self, state: AgentState) -> dict:
