@@ -19,3 +19,6 @@ chat_history/
 hybrid_db/
 *.txt
 improvement.md
+.pytest_cache/
+.ruff_cache/
+TestAnswerLog/

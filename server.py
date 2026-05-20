@@ -1,11 +1,11 @@
-#sever.py
+#server.py
 import os
 import json
 import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, StreamingResponse
-from typing import List, Dict
+from typing import Any, List, Dict
 import socketio
 import uvicorn
 import re
@@ -19,114 +19,44 @@ import warnings
 import sys
 import io
 import tempfile
-from data_loader import MultiFormatDocumentLoader
+from extraction import MultiFormatDocumentLoader, SuryaLayoutExtractor
 warnings.filterwarnings("ignore", category=FutureWarning)
-from script import format_documents, original_chain, condense_chain, router_chain
-
+from script import format_documents,  condense_chain, unified_chain
+import os 
 from datetime import datetime
-
+from main import app as langgraph_app
+from logger_utils import log_timing, log_debug, timed
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # --- Global Task Tracker ---
 active_tasks: Dict[str, asyncio.Task] = {}
-def get_today_log_file():
-    today = datetime.now().strftime("%d%m%Y")
-    return os.path.join(LOG_DIR, f"log{today}.txt")
-
-def timed(func):
-    @functools.wraps(func)
-    async def async_wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = await func(*args, **kwargs)
-        duration = (time.perf_counter() - start) * 1000
-        log_timing(f"[TOTAL] {func.__name__} took {duration:.2f} ms")
-        return result
-
-    @functools.wraps(func)
-    def sync_wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = func(*args, **kwargs)
-        duration = (time.perf_counter() - start) * 1000
-        log_timing(f"[TOTAL] {func.__name__} took {duration:.2f} ms")
-        return result
-
-    if inspect.iscoroutinefunction(func):
-        return async_wrapper
-    return sync_wrapper
-
-
-def log_timing(message: str):
-    log_file = get_today_log_file()
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {message}\n")
-def log_debug(message: str):
-    log_timing(f"[DEBUG] {message}")
-
-logger = logging.getLogger("timing_logger")
 # --- Your Existing RAG and LangChain Imports ---
 from retriever import retriever
 import fitz
 
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
+from context_memory import (
+    get_session_history,       
+    store_uploaded_document,   
+    evict_session,             
+    shutdown_memo,
+)
+from contextlib import asynccontextmanager
+from langchain_core.messages import HumanMessage, AIMessage
 from config import settings
 
 # --- CONFIGURATION ---
 HISTORY_DIR = settings.HISTORY_DIR
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
-# --- Custom Chat History Class for File Persistence ---
-# This class is already perfect and needs no changes.
-class FileChatMessageHistory(BaseChatMessageHistory):
-    session_id: str
-    file_path: str
-
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.file_path = os.path.join(HISTORY_DIR, f"{self.session_id}.json")
-
-    @property
-    def messages(self) -> List[BaseMessage]:
-        if not os.path.exists(self.file_path):
-            return []
-        with open(self.file_path, "r", encoding="utf-8") as f:
-            try:
-                dicts = json.load(f)
-                all_messages = messages_from_dict(dicts)
-                all_messages = all_messages[-6:]
-                for msg in all_messages:
-                    if hasattr(msg, "content") and isinstance(msg.content, str):
-                        msg.content = msg.content.strip()[:300]
-                return all_messages
-            except json.JSONDecodeError:
-                return []
-
-    def add_messages(self, messages: List[BaseMessage]) -> None:
-        # current_messages = self.messages
-        if not os.path.exists(self.file_path):
-            current_messages = []
-        else:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                try:
-                    dicts = json.load(f)
-                    current_messages = messages_from_dict(dicts)
-                except json.JSONDecodeError:
-                    current_messages = []
-        current_messages.extend(messages)
-        with open(self.file_path, "w", encoding="utf-8") as f:
-            dicts = messages_to_dict(current_messages)
-            json.dump(dicts, f, indent=2)
-
-    def clear(self) -> None:
-        if os.path.exists(self.file_path):
-            os.remove(self.file_path)
 
 # --- FastAPI & Socket.IO App Initialization ---
+@asynccontextmanager
+async def lifespan(app):
+    yield                  # startup — nothing extra needed
+    shutdown_memo()  
 app = FastAPI(
+    lifespan=lifespan,
     title="RAG API Server with Per-User History",
     description="An API for a multi-user document assistant that persists conversation history.",
     version="2.2.0"
@@ -135,26 +65,45 @@ app = FastAPI(
 # Mount the 'static' directory to serve your HTML, CSS, and JS files.
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Initialize the Socket.IO server with CORS enabled for all origins for easier development.
+# Initialize the Socket.IO server with CORS stricted to allowed origins
+# allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8010").split(",")
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 # Combine the FastAPI and Socket.IO apps into one.
 socket_app = socketio.ASGIApp(sio, app)
 
 # In-memory cache for history objects to improve performance.
-store: Dict[str, BaseChatMessageHistory] = {}
 
-def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    if session_id not in store:
-        store[session_id] = FileChatMessageHistory(session_id=session_id)
-    return store[session_id]
 
-# Wrap the LangChain chain with the history management logic.
-chain_with_history = RunnableWithMessageHistory(
-    original_chain,
-    get_session_history,
-    input_messages_key="question",
-    history_messages_key=HISTORY_DIR,
-)
+def _extract_stream_text(event: Dict[str, Any]) -> str:
+    """Extract token text from either chat-model or llm stream events."""
+    data = event.get("data") or {}
+    chunk = data.get("chunk")
+    if chunk is None:
+        return ""
+
+    if isinstance(chunk, str):
+        return chunk
+
+    text = getattr(chunk, "text", None)
+    if isinstance(text, str):
+        return text
+
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+        return "".join(parts)
+
+    return ""
 
 # --- Socket.IO Event Handlers ---
 @sio.event
@@ -164,9 +113,7 @@ async def connect(sid, environ):
 @sio.event
 async def disconnect(sid):
     print(f"Client disconnected: {sid}")
-    # Clean up from the in-memory cache on disconnect.
-    if sid in store:
-        del store[sid]
+    evict_session(sid)  
 
 @sio.on("chat_request")
 @timed
@@ -192,294 +139,177 @@ async def handle_chat_request(sid, data: dict):
         active_tasks.pop(sid, None)
        
 async def run_llm_logic(sid, data: dict):
-    """Actual RAG and LLM logic extracted from the main handler."""
+    """Actual RAG and LLM logic orchestrated by LangGraph."""
     user_query = data.get("message", "")
-    log_debug(f"Received query: {user_query}")
-    uploaded_doc_text = ""
     file_info = data.get("file")
+    ui_target_files= data.get("target_files",[])
+    log_debug(f"Received query from {sid}: {user_query}")
+    
+    uploaded_doc_text = ""
     tmp_path = None
     
+    # ------------------ FILE UPLOAD HANDLING ------------------
+            
     if file_info:
         file_name = file_info.get("name", "uploaded_document")
-        file_bytes = file_info.get("data") # Received as bytes from SocketIO ArrayBuffer
-        log_debug(f"File received: {file_name}")
-        
-        # 1. Safely create the temporary file path
+        file_bytes = file_info.get("data")
         suffix = os.path.splitext(file_name)[1]
+        log_debug(f"Processing uploaded file: {file_name}")
         
-        # 2. Open, write, and CLOSE the file using a context manager
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_bytes)
-            tmp.flush() # Force write to disk
+            tmp.flush()
             tmp_path = tmp.name 
-        # The file is now closed and accessible to other processes/threads.
 
         try:
-            # 3. Process the fully saved file
             def process_uploaded_file():
-                # --- Create and set a new event loop for this background thread ---
                 thread_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(thread_loop)
-                
                 try:
-                    loader = MultiFormatDocumentLoader()
-                    return loader.load_document(tmp_path)
+                    
+                    with SuryaLayoutExtractor() as loader:
+                        return loader.extract(tmp_path)
                 finally:
-                    # Always clean up the loop when done
                     thread_loop.close()
                 
             docs = await asyncio.to_thread(process_uploaded_file)
-            uploaded_doc_text = "\n\n".join([d.page_content for d in docs])
-            
+            if isinstance(docs, str):
+                uploaded_doc_text = docs
+            elif isinstance(docs, list):
+                uploaded_doc_text = "\n\n".join([d.page_content for d in docs])
+            else:
+                uploaded_doc_text = str(docs)
+
+            # Save unconditionally, regardless of which branch ran
+            if uploaded_doc_text:
+                history_obj = get_session_history(sid)
+                history_obj.save_document(uploaded_doc_text, filename=file_name)
             log_debug(f"Extracted {len(uploaded_doc_text)} chars from uploaded document.")
-            print(f"DEBUG EXTRACTED TEXT: {uploaded_doc_text[:200]}...") # Print first 200 chars for terminal debugging
             
         except Exception as e:
-            log_debug(f"Error extracting text from uploaded file: {e}")
-            print(f"Error extracting text: {e}")
-            import traceback
-            traceback.print_exc()
+            log_debug(f"File extraction error: {e}")
+            await sio.emit("chat_stream_chunk", {"chunk": "⚠️ *Warning: Could not read the uploaded file correctly. Proceeding with database context only.* \n\n"}, to=sid)
         finally:
-            # 4. Clean up the file after processing
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except Exception as cleanup_error:
                     log_debug(f"Could not remove temp file: {cleanup_error}")
+
+    # ------------------ LANGGRAPH ORCHESTRATION ------------------
     # 0. Get history
+    files_response = await get_available_files()
+    available_files = files_response.get("files", [])
     history_obj = get_session_history(sid)
-    chat_history = history_obj.messages
+    # --- ADD THIS BLOCK TO PRINT HISTORY TO TERMINAL ---
+    print(f"\n=== LOADED HISTORY FOR SESSION: {sid} ===")
+    for i, msg in enumerate(history_obj.messages):
+        # msg.type will be 'human', 'ai', or 'system'
+        snippet = msg.content[:60].replace("\n", " ") + ("..." if len(msg.content) > 60 else "")
+        metadata = msg.additional_kwargs
+        print(f"[{i}] {msg.type.upper()}: {snippet} | metadata: {metadata}")
+    print("================================================\n")
+    # ---------------------------------------------------
+    if not ui_target_files and history_obj.messages:
+        # Look backwards through the messages for the last AI message with target_files
+        for msg in reversed(history_obj.messages):
+            if isinstance(msg, AIMessage) and "target_files" in msg.additional_kwargs:
+                ui_target_files = msg.additional_kwargs["target_files"]
+                break
 
-    
-    # ------------------ CONDENSE ------------------
-    if chat_history:
-        start = time.perf_counter()
-
-        condensed_result = await condense_chain.ainvoke({
-            "question": user_query,
-            settings.HISTORY_DIR: chat_history,
-        })
-
-        condense_time = (time.perf_counter() - start) * 1000
-
-        # Process condensed result ONLY here
-        if isinstance(condensed_result, dict):
-            standalone_question = condensed_result.get("retrieval_queries", [user_query])
-            generation_question = condensed_result.get("generation_question", user_query)
-        elif isinstance(condensed_result, list):
-            standalone_question = condensed_result
-            generation_question = " and ".join(condensed_result)
-        else:
-            standalone_question = [user_query]
-            generation_question = user_query
-
-    else:
-        standalone_question = [user_query]
-        generation_question = user_query
-        condense_time = 0
-
-    log_timing(f"[LATENCY] Condense: {condense_time:.2f} ms")
-
+    # 1. Initialize Graph State
+    initial_state = {
+        "question": user_query,
+        "chat_histories": history_obj.messages,
         
-    log_debug(f"Standalone question: {standalone_question}")
-    log_debug(f"Generation question: {generation_question}")
+        # Note: If your LangGraph needs uploaded_doc_text, you can pass it here
+        "uploaded_doc_text": uploaded_doc_text,
+        "available_files": available_files,
+        "target_files": ui_target_files
+    }
 
-    target_files = data.get("target_files", [])
-    
-    # --- NEW ROUTER LOGIC FOR UPLOADED FILES ---
-    if uploaded_doc_text and not target_files:
-        start_router = time.perf_counter()
-        log_debug("Uploaded document detected. Running Router LLM to determine target files...")
-        try:
-            available_files = []
-            if os.path.exists(settings.DOCUMENTS_DIR):
-                available_files = [f for f in os.listdir(settings.DOCUMENTS_DIR) if f.endswith(".pdf") or f.endswith(".docx")]
-            
-            # The chain is imported from script.py, we just invoke it here
-            llm_target_files = await router_chain.ainvoke({
-                "question": user_query,
-                "uploaded_text": uploaded_doc_text[:2000],
-                "available_files": available_files
-            })
-            
-            # --- UPDATE THESE TWO LINES ---
-            if isinstance(llm_target_files, dict):
-                target_files = [f for f in llm_target_files.get("target_files", []) if f in available_files]
-            # ------------------------------
-                
-            router_time = (time.perf_counter() - start_router) * 1000
-            log_timing(f"[LATENCY] Router LLM: {router_time:.2f} ms")
-            log_debug(f"Router selected valid files: {target_files}")
-            
-        except Exception as e:
-            log_debug(f"⚠️ Router LLM failed, falling back to all files. Error: {e}")
-    # -------------------------------------------
-
-    if target_files:
-        log_debug(f"Final targeting specific files: {target_files}")
-        
-    start = time.perf_counter()
-    # 1. Retrieval
-    retrieval_tasks = [retriever.ainvoke(q, target_sources=target_files) for q in standalone_question]
-    # 1. Retrieval    retrieval_tasks = [retriever.ainvoke(q) for q in standalone_question]
-
-    results = await asyncio.gather(*retrieval_tasks)
-
-    retrieval_time = (time.perf_counter() - start) * 1000
-    log_timing(f"[LATENCY] Retrieval: {retrieval_time:.2f} ms")
-
-    # ------------------ DEDUP ------------------
-    start = time.perf_counter()
-
-    unique_docs_map = {}
-    for doc_list in results:
-        for doc in doc_list:
-            if doc.page_content not in unique_docs_map:
-                unique_docs_map[doc.page_content] = doc
-
-    retrieved_docs = list(unique_docs_map.values())
-    is_weak_retrieval = len(retrieved_docs) < 5
-
-    dedup_time = (time.perf_counter() - start) * 1000
-    log_timing(f"[LATENCY] Dedup: {dedup_time:.2f} ms")
-
-    log_debug(f"Total Unique Retrieved Docs: {len(retrieved_docs)}")
-
-    # ------------------ HYDE FALLBACK ------------------
-    if is_weak_retrieval and len(generation_question.split()) > 3:
-        log_debug("[HYDE] Weak retrieval detected, retrying with HYDE...")
-
-        from script import generate_hyde_query
-
-        try:
-            hyde_query = generate_hyde_query(generation_question)
-
-            hyde_results = await retriever.ainvoke(
-                hyde_query,
-                target_sources=target_files
-            )
-
-            # 🔥 merge HYDE results
-            for doc in hyde_results:
-                if doc.page_content not in unique_docs_map:
-                    unique_docs_map[doc.page_content] = doc
-
-            retrieved_docs = list(unique_docs_map.values())
-
-            log_debug(f"[HYDE] Retrieved {len(retrieved_docs)} docs after retry")
-
-            # 🔥 DEBUG safety
-            if len(retrieved_docs) < 5:
-                log_debug("[HYDE] Still weak after retry")
-
-        except Exception as e:
-            log_debug(f"[HYDE ERROR] {e}")
-
-    # 🔥 LIMIT BEFORE RERANK (CRITICAL)
-    retrieved_docs = retrieved_docs[:20]
-
-    # ------------------ FORMAT DOCS (OPTIONAL BUT SMART) ------------------
-    start = time.perf_counter()
-
-    context, citation = format_documents(retrieved_docs)
-
-    format_time = (time.perf_counter() - start) * 1000
-    log_timing(f"[LATENCY] Format Docs: {format_time:.2f} ms")
-
-    
-    if not context:
-        context = "No relevant documents found in the knowledge base."
-        citation = []
-
-    with open("chunk.txt", "w", encoding="utf-8") as f:
-        f.write(context)
-        
-    log_debug(f"Context Preview: {context[:800]}")
-    log_debug(f"Context Length: {len(context)} chars")
-    # 2. Streaming Response
-    full_response = ""
-    final_prompt_preview = f"""
-        --- FINAL PROMPT ---
-        Context:
-        {context[:800]}
-
-        Question:
-        {generation_question}
-        ---------------------
-        """
-    log_debug(final_prompt_preview)
-
-    # Always print the question
-    print(f"Question: {generation_question}")
-    
-    # If there is extracted text, save it to a file
-    if uploaded_doc_text:
-        with open("upload_content.txt", "w", encoding="utf-8") as f:
-            f.write(uploaded_doc_text)
-        print("📁 Saved extracted document text to upload_content.txt")
-
-    # Initialize final_citations to empty list BEFORE try block
+    final_response_nodes = {"text_path", "synthesize_response"}
     final_citations = []
-    llm_time = 0
+    final_response_text = ""
+    fallback_final_response = ""
+    
+    final_target_files = ui_target_files
+
     start = time.perf_counter()
+
     try:
-        async for chunk in chain_with_history.astream(
-            {
-                "context": context, 
-                "question": generation_question,
-                "uploaded_doc_text": uploaded_doc_text  
-            },
-            config={"configurable": {"session_id": sid}}
-        ):
-            chunk_text = chunk if isinstance(chunk, str) else chunk.content
-            full_response += chunk_text
+        # Use astream_events to catch both node updates AND LLM tokens
+        async for event in langgraph_app.astream_events(initial_state, version="v2"):
+            kind = event["event"]
             
-            if chunk_text:
-                await sio.emit("chat_stream_chunk", {"chunk": chunk_text}, to=sid)
-
-        llm_time = (time.perf_counter() - start) * 1000
-        log_timing(f"[LATENCY] LLM: {llm_time:.2f} ms")
-
-        # -------- Citation Extraction --------
-        try:
-            used_ids_matches = re.findall(r'[\[【](\d+)[\]】]', full_response)
-            used_ids = set()
-            for idx_str in used_ids_matches:
-                try:
-                    used_ids.add(int(idx_str))
-                except (ValueError, TypeError):
-                    log_debug(f"⚠️ Could not convert citation index '{idx_str}' to int")
-                    continue
-            
-            # Filter citations that were actually used in response
-            if used_ids:
-                final_citations = [c for c in citation if c["id"] in used_ids]
+            # Catch Node Completions (For UI status updates and Citations)
+            if kind == "on_chain_end":
+                node_name = event["name"]
+                state_update = event["data"].get("output", {})
                 
-        except Exception as cite_error:
-            log_debug(f"⚠️ Error extracting citations: {cite_error}")
-            final_citations = citation  # fallback to all citations
+                if isinstance(state_update, dict):
+                    new_files = state_update.get("target_files") or state_update.get("combined_target_files")
+                    if new_files:
+                        final_target_files = new_files
+                        log_debug(f"Successfully captured target_files for history: {final_target_files}")
+                    if "citations" in state_update and not final_citations:
+                        final_citations = state_update["citations"]
+                    if node_name in final_response_nodes:
+                        maybe_final = state_update.get("final_response", "")
+                        if isinstance(maybe_final, str) and maybe_final.strip():
+                            fallback_final_response = maybe_final
+
+                    if node_name == "classify_and_retrieve":
+                        if state_update.get("math_intent"):
+                            await sio.emit("chat_stream_chunk", {"chunk": "\n🔢 **Math intent detected. Activating Math Agent...**\n"}, to=sid)
+                        else:
+                            await sio.emit("chat_stream_chunk", {"chunk": "🔍 *Searching knowledge base...*\n"}, to=sid)
+                    elif node_name == "math_generate":
+                        await sio.emit("chat_stream_chunk", {"chunk": "⚙️ *Generating calculation logic...*\n"}, to=sid)
+                    elif node_name == "math_execute":
+                        await sio.emit("chat_stream_chunk", {"chunk": "⏳ *Computing results in sandbox...*\n\n"}, to=sid)
+
+            # Catch live LLM token streaming
+            elif kind in ("on_chat_model_stream", "on_llm_stream"):
+                event_node = (event.get("metadata") or {}).get("langgraph_node")
+                if event_node and event_node not in final_response_nodes:
+                    continue
+                chunk_text = _extract_stream_text(event)
+                if chunk_text:
+                    final_response_text += chunk_text
+                    await sio.emit("chat_stream_chunk", {"chunk": chunk_text}, to=sid)
+
+        if not final_response_text and fallback_final_response:
+            final_response_text = fallback_final_response
+            await sio.emit("chat_stream_chunk", {"chunk": final_response_text}, to=sid)
+
+        if not final_response_text:
+            final_response_text = "I could not generate a response this time. Please try again."
+            await sio.emit("chat_stream_chunk", {"chunk": final_response_text}, to=sid)
+
+        total_time = (time.perf_counter() - start) * 1000
+        log_timing(f"[SUMMARY] Total LangGraph Execution: {total_time:.0f}ms")
+
+        # 3. Save to history and close stream
+        history_obj.add_messages([
+            HumanMessage(content=user_query),
+            AIMessage(
+                content=final_response_text,
+                additional_kwargs={"target_files": final_target_files}
+                )
+        ])
         
         await sio.emit("chat_stream_end", {"message": "Stream complete", "citation": final_citations}, to=sid)
-        log_debug(f"Final Response Preview: {full_response[:500]}")
-        log_debug(f"Response Length: {len(full_response)} chars")
-        log_debug(f"Citations sent: {len(final_citations)}")
-        
+
+    except asyncio.CancelledError:
+        log_timing(f"Generation cancelled for {sid}")
+        raise # Allow the outer task wrapper to handle the cancellation
+
     except Exception as e:
-        log_debug(f"Error during streaming: {e}")
-        log_debug(f"Error type: {type(e).__name__}")
+        log_debug(f"Error during Graph Execution: {e}")
         import traceback
         log_debug(traceback.format_exc())
-
         await sio.emit("error", {"message": str(e)}, to=sid)
-
-    # ------------------ SUMMARY ------------------
-    log_timing(
-        f"[SUMMARY] condense={condense_time:.0f}ms | "
-        f"retrieval={retrieval_time:.0f}ms | "
-        f"dedup={dedup_time:.0f}ms | "
-        f"format={format_time:.0f}ms | "
-        f"llm={llm_time:.0f}ms"
-    )
 
 @sio.on("stop_generation")
 async def handle_stop_generation(sid):
@@ -497,8 +327,9 @@ async def read_root():
 
 @app.get("/v1/history/{session_id}")
 def get_history(session_id: str):
-    """A utility endpoint to inspect the history file of a given session."""
-    history = FileChatMessageHistory(session_id=session_id)
+    if not os.getenv("DEBUG_HISTORY_ENDPOINT", "false").lower() == "true":
+        raise HTTPException(status_code=403, detail="History endpoint disabled.")
+    history = get_session_history(session_id)  # ← was FileChatMessageHistory(...)
     return history.messages
 
 @app.get("/v1/document-page")
@@ -516,11 +347,16 @@ async def get_document_page(source: str, page: int = 0):
         target_path = source
     abs_source = os.path.realpath(target_path)
     abs_allowed = os.path.realpath(settings.DOCUMENTS_DIR)
-    if not abs_source.startswith(abs_allowed):
-        print(f"DEBUG: Blocked access. {abs_source} is not inside {abs_allowed}")
+    
+    # Use os.path.commonpath to ensure strict containment
+    try:
+        common = os.path.commonpath([abs_source, abs_allowed])
+        if common != abs_allowed:
+            raise HTTPException(status_code=403, detail="Access denied.")
+    except ValueError:
         raise HTTPException(status_code=403, detail="Access denied.")
+    
     if not os.path.exists(abs_source):
-        print(f"DEBUG: File not found at {abs_source}")
         raise HTTPException(status_code=404, detail="Document not found.")
 
     ext = os.path.splitext(abs_source)[1].lower()
@@ -538,20 +374,24 @@ async def get_document_page(source: str, page: int = 0):
     # ── Word / DOCX — convert the whole doc to PDF first ─
     elif ext in (".docx", ".doc"):
         try:
-            import subprocess, tempfile
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp_pdf = tmp.name
-            subprocess.run(
-                ["libreoffice", "--headless", "--convert-to", "pdf",
-                 "--outdir", os.path.dirname(tmp_pdf), abs_source],
-                check=True, capture_output=True
-            )
-            converted = os.path.splitext(abs_source)[0] + ".pdf"
-            doc = fitz.open(converted)
-            pdf_page = doc[min(page, len(doc) - 1)]
-            mat = fitz.Matrix(2.0, 2.0)
-            pix = pdf_page.get_pixmap(matrix=mat, alpha=False)
-            img_bytes = pix.tobytes("png")
+            import subprocess
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                src_stem = os.path.splitext(os.path.basename(abs_source))[0]
+                subprocess.run(
+                    ["libreoffice", "--headless", "--convert-to", "pdf",
+                     "--outdir", tmp_dir, abs_source],
+                    check=True, capture_output=True, timeout=30
+                )
+                converted = os.path.join(tmp_dir, f"{src_stem}.pdf")
+                if not os.path.exists(converted):
+                    raise HTTPException(status_code=500, detail="PDF conversion did not produce output.")
+                doc = fitz.open(converted)
+                pdf_page = doc[min(page, len(doc) - 1)]
+                mat = fitz.Matrix(2.0, 2.0)
+                pix = pdf_page.get_pixmap(matrix=mat, alpha=False)
+                img_bytes = pix.tobytes("png")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=500, detail="Conversion timed out.")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")
 

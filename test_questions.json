@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "question": "What is CESC?"
+  },
+  {
+    "id": 2,
+    "question": "List all electrical distribution companies in West Bengal"
+  },
+  {
+    "id": 3,
+    "question": "What are the components for billing in CESC, UPPCL, MSEDCL for 20 kW load?"
+  },
+  {
+    "id": 4,
+    "question": "What is the security deposit demand for 5 kW load in GESCOM, MESCOM, HESCOM, BESCOM?"
+  },
+  {
+    "id": 5,
+    "question": "What is the APERC tariff order for FY 2025-26?"
+  },
+  {
+    "id": 6,
+    "question": "Which DISCOM has the highest sales forecast?"
+  },
+  {
+    "id": 7,
+    "question": "What are the components of fixed charges?"
+  },
+  {
+    "id": 8,
+    "question": "What is IPCL?"
+  },
+  {
+    "id": 9,
+    "question": "What is TPMDL?"
+  },
+  {
+    "id": 10,
+    "question": "List all tables in the documents"
+  }
+]
