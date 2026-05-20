@@ -17,7 +17,7 @@ from docx.oxml.ns import qn
 import hashlib
 import uuid
 import fitz
-
+import numpy as np
 from llm_clients import query_ollama
 import tiktoken
 
@@ -93,24 +93,6 @@ class SemanticAwareTextSplitter:
         except ImportError:
             return False
 
-    # def compute_target_size(self, text: str) -> int:
-    #     words = text.split()
-    #     if not words:
-    #         return self.BASE_CHUNK_CHARS
-
-    #     unique_ratio = len({w.lower() for w in words}) / len(words)
-    #     avg_word_len = sum(len(w) for w in words) / len(words)
-
-    #     density = min(1.0,
-    #                   unique_ratio * 0.6
-    #                   + min(avg_word_len, 8) / 8 * 0.4)
-
-    #     target = int(
-    #         self.MAX_CHUNK_CHARS
-    #         - density * (self.MAX_CHUNK_CHARS - self.MIN_CHUNK_CHARS)
-    #     )
-    #     return max(self.MIN_CHUNK_CHARS, min(self.MAX_CHUNK_CHARS, target))
-
     def tokenize_sentences(self, text: str) -> list[str]:
         protected = self._ABBREV_RE.sub(
             lambda m: m.group().replace(". ", ".\x00"), text
@@ -129,55 +111,6 @@ class SemanticAwareTextSplitter:
 
         return sentences or [text.strip()]
 
-    # def _pairwise_distances(self, sentences: list[str]) -> list[float]:
-    #     if len(sentences) < 2:
-    #         return []
-
-    #     if self._has_sklearn:
-    #         try:
-    #             vec = self._TfidfVectorizer(
-    #                 analyzer="char_wb", ngram_range=(3, 5), min_df=1
-    #             )
-    #             matrix = vec.fit_transform(sentences)
-    #             return [
-    #                 1.0 - float(
-    #                     self._cosine_similarity(matrix[i], matrix[i + 1])[0][0]
-    #                 )
-    #                 for i in range(len(sentences) - 1)
-    #             ]
-    #         except Exception:
-    #             pass  # Fall through to Jaccard
-
-    #     def _jaccard(a: str, b: str) -> float:
-    #         sa, sb = set(a.lower().split()), set(b.lower().split())
-    #         if not sa and not sb:
-    #             return 0.0
-    #         return 1.0 - len(sa & sb) / len(sa | sb)
-
-    #     return [_jaccard(sentences[i], sentences[i + 1])
-    #             for i in range(len(sentences) - 1)]
-
-    # def find_semantic_boundaries(self, sentences: list[str]) -> set[int]:
-    #     distances = self._pairwise_distances(sentences)
-    #     if not distances:
-    #         return set()
-
-    #     arr = np.array(distances)
-    #     adaptive_threshold = max(
-    #         self.BOUNDARY_THRESHOLD,
-    #         float(arr.mean() + 0.5 * arr.std()),
-    #     )
-
-    #     boundaries: set[int] = set()
-    #     for i, d in enumerate(distances):
-    #         if d < adaptive_threshold:
-    #             continue
-    #         left  = distances[i - 1] if i > 0                   else -1.0
-    #         right = distances[i + 1] if i + 1 < len(distances)  else -1.0
-    #         if d >= left and d >= right:
-    #             boundaries.add(i + 1)
-
-    #     return boundaries
 
     def split(self, text: str) -> list[str]:
         sentences = self.tokenize_sentences(text)

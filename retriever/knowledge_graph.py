@@ -463,7 +463,7 @@ class GraphRetriever:
 # Factory — used by retriever.py
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_graph_retriever(corpus: List[Dict]) -> GraphRetriever:
+def build_graph_retriever(corpus: List[Dict], removed_sources: List[str] = None) -> GraphRetriever:
     """
     Build (or update) the KG from corpus, persist it, return a GraphRetriever.
     Called once from initialize_retriever().
@@ -480,6 +480,17 @@ def build_graph_retriever(corpus: List[Dict]) -> GraphRetriever:
             entity_index={},
             nlp=None,
         )
+    kg_changed = False
+
+    # --- BUG FIX: Purge stale sources ---
+    if removed_sources:
+        removed_count = 0
+        for source in removed_sources:
+            removed_count += builder.remove_source(source)
+        if removed_count > 0:
+            print(f"  Purged {removed_count} stale chunk nodes from KG.")
+            kg_changed = True
+    # ------------------------------------
 
     # Identify which chunks are new (not yet in the graph)
     new_chunks = [
@@ -504,6 +515,10 @@ def build_graph_retriever(corpus: List[Dict]) -> GraphRetriever:
         except Exception as e:
             print(f"❌ Error building KG: {e}")
             print("⚠️ Continuing without KG updates")
+    # --- FIX: Save if anything changed (additions OR deletions) ---
+    if kg_changed:
+        save_kg(builder.G, builder.entity_index)
+        print(f"  ✓ KG saved: {builder.G.number_of_nodes()} nodes, {builder.G.number_of_edges()} edges.")
     else:
         print("KG is up to date.")
 

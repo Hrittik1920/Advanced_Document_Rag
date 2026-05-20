@@ -23,7 +23,8 @@ _condense_model = OllamaLLM(
     model=MODEL_NAME,
     base_url=OLLAMA_BASE_URL,
     streaming=False,
-    temperature=0.3,      
+    temperature=0.3,
+    reasoning=False,      
 )
 
 _math_coding_model = OllamaLLM(
@@ -294,7 +295,8 @@ _unified_model = OllamaLLM(
     model=MODEL_NAME,
     base_url=OLLAMA_BASE_URL,
     streaming=False,
-    temperature=0.2,      
+    temperature=0.2, 
+    reasoning=False,     
 )
 
 unified_prompt = ChatPromptTemplate.from_messages([
