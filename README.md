@@ -1,6 +1,6 @@
-# BillPro Multi-Docs Chatbot
+# Multi-Docs Chatbot
 
-BillPro Multi-Docs Chatbot is a FastAPI, Socket.IO, LangGraph, and LangChain based RAG application for answering questions over a corpus of electricity tariff documents. It supports multi-document retrieval, citations, document page previews, uploaded bill extraction, and a separate math-agent path for billing calculations.
+Multi-Docs Chatbot is a FastAPI, Socket.IO, LangGraph, and LangChain based RAG application for answering questions over a corpus of electricity tariff documents. It supports multi-document retrieval, citations, document page previews, uploaded bill extraction, and a separate math-agent path for billing calculations.
 
 The application is optimized for Indian DISCOM tariff PDFs and related billing documents, but the ingestion pipeline also supports DOCX, CSV, Excel, TXT, and image files.
 
